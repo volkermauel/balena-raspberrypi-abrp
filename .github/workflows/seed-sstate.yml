@@ -1,0 +1,47 @@
+name: Seed sstate artifact
+
+# abrp: one-off / maintenance helper. GitHub-hosted builds keep their sstate
+# cache in a workflow artifact (<machine>-sstate, see yocto-build-deploy.yml),
+# but only a *successful* hostapp build writes one — a cold build that hits
+# the 6h job cap never seeds it (catch-22). This workflow tars the persistent
+# sstate dir from the self-hosted runner and uploads it under the same
+# artifact name, so the next GitHub-hosted build restores it and starts warm.
+
+on:
+  workflow_dispatch:
+    inputs:
+      machines:
+        description: 'JSON array of machines to seed'
+        required: true
+        default: '["raspberrypi4-64", "raspberrypi5"]'
+
+jobs:
+  seed-sstate:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines) }}
+    steps:
+      - name: Pack sstate
+        run: |
+          set -euo pipefail
+          src="/srv/yocto/shared/${{ matrix.machine }}/sstate"
+          test -d "$src"
+          du -sh "$src"
+          tar -cf /tmp/sstate.tar -C "/srv/yocto/shared/${{ matrix.machine }}" sstate
+          ls -lh /tmp/sstate.tar
+
+      - name: Upload sstate artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ matrix.machine }}-sstate
+          path: /tmp/sstate.tar
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Clean up
+        if: always()
+        run: rm -f /tmp/sstate.tar
