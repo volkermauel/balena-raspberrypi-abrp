@@ -2,9 +2,12 @@
 # balena_os/<fleet>-supervisor API lookup that openBalena cannot answer)
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
-# abrp: render the helios image version into entry.sh. do_configure is
-# noexec in this recipe, so hook do_install instead (runs before the
-# docker build that COPYs entry.sh).
-do_install:prepend() {
+# abrp: render the helios image version into entry.sh. The docker build
+# that COPYs entry.sh runs in do_compile (do_patch/do_configure are noexec
+# in this recipe, and do_install runs after do_compile). Recopy the pristine
+# file first so a stale rendered entry.sh in a reused WORKDIR can't mask
+# HELIOS_VERSION changes.
+do_compile:prepend() {
+    install -m 0755 ${THISDIR}/files/entry.sh ${WORKDIR}/entry.sh
     sed -i "s,@HELIOS_VERSION@,${HELIOS_VERSION},g" ${WORKDIR}/entry.sh
 }

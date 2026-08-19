@@ -20,7 +20,8 @@
 
 ## 4. Preload
 
-- [x] `docker-disk/files/entry.sh` — pull `ghcr.io/balena-io/helios:@HELIOS_VERSION@` (rendered by docker-disk.bbappend `do_install:prepend`)
+- [x] `docker-disk/files/entry.sh` — pull `ghcr.io/balena-io/helios:@HELIOS_VERSION@` (rendered by docker-disk.bbappend `do_compile:prepend`; first CI attempt failed because the sed ran in `do_install`, after the docker build — fixed)
+- [x] Verified `ghcr.io/balena-io/helios:0.25.28` anonymously pullable (manifest 200, digest sha256:5bd00cbefe75…) — no self-build required
 
 ## 5. Verification
 
