@@ -1,0 +1,21 @@
+# Change Proposal: add-supervisor-composition
+
+## Why
+
+The upstream supervisor v19 ships as a composition (`core`, `core-next`, `service-relay`) that enables the helios "strangler fig" migration: core-next (helios) proxies all traffic between the legacy supervisor and the cloud, enabling queued OS updates, differential reporting, and progressive feature takeover. Our fleet builds (openBalena backend) deploy the supervisor as a single container via `balena-supervisor.service` — the composition never reaches the device because openBalena has no supervisor fleets or `/v6/supervisor_release` resource.
+
+## What Changes
+
+Deploy the supervisor composition device-side in the OS image:
+
+- Add a `docker-compose` binary recipe (docker/compose v5.5.0, aarch64, checksum-pinned).
+- Add `supervisor-compose.yml` (core-next + service-relay only; `core` stays a single container started by `balena-supervisor.service`) rendered at build time with a pinned `HELIOS_VERSION`.
+- Add `balena-supervisor-next.service` which runs `docker compose up` after the supervisor starts, plus `supervisor-compose-env.sh` which waits for the supervisor, extracts its API key from its sqlite DB, and ensures the `supervisor0` network exists.
+- Preload the helios image in the docker-disk build so devices boot fully offline.
+
+##Impact
+
+- Devices gain the helios proxy: supervisor API traffic flows `supervisor → 127.0.0.1:48484 (relay) → helios → openBalena API`, with helios intercepting target-state requests.
+- Takeover is persistent: helios writes `apiEndpointOverride`/`listenPortOverride` into the supervisor DB and re-binds the supervisor API to `10.114.104.1:48480`. See design.md for the rollback procedure.
+- Helios version advances only on OS rebuild (accepted trade-off; openBalena has no supervisor fleet for runtime updates).
+- No changes to how user applications are deployed or updated.

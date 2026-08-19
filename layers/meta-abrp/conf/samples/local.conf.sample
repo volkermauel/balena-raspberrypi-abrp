@@ -113,3 +113,8 @@ FETCHCMD_wget = "/usr/bin/env wget -t 2 -T 100 --user-agent=abrp-fetch-1.0 -nv -
 # ghcr.io/volkermauel/aarch64-supervisor and the build-supervisor workflow)
 # Global (not recipe bbappend) because docker-disk.bb requires balena-supervisor.inc directly.
 SUPERVISOR_VERSION = "v19.0.8"
+
+# abrp: helios version for the supervisor composition (core-next/service-relay).
+# Must match a tag in ghcr.io/balena-io/helios. Global because both the
+# balena-supervisor and docker-disk recipes render it.
+HELIOS_VERSION = "0.25.28"

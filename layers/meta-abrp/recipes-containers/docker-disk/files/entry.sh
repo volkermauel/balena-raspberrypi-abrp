@@ -70,6 +70,16 @@ if [ -n "${SUPERVISOR_VERSION}" ]; then
 	fi
 fi
 
+# abrp: preload the helios image used by the supervisor composition
+# (balena-supervisor-next.service). @HELIOS_VERSION@ is rendered by the
+# meta-abrp docker-disk bbappend from the global HELIOS_VERSION variable.
+_helios_image="ghcr.io/balena-io/helios:@HELIOS_VERSION@"
+echo "Pulling ${_helios_image}"
+if ! docker pull "${_helios_image}"; then
+    echo "Not able to pull ${_helios_image}"
+    exit 1
+fi
+
 echo "Stopping docker..."
 kill -TERM "$(cat /var/run/docker.pid)"
 # don't let wait() error out and crash the build if the docker daemon has already been stopped
