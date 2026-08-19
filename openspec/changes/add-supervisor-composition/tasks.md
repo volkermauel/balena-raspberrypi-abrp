@@ -39,6 +39,6 @@
 - [x] `files/update-controlplane.{service,timer}` — daily channel follow (OnBootSec=20min, OnUnitInactiveSec=1d)
 - [x] `.github/workflows/build-controlplane.yml` — pair CI: pulls `aarch64-supervisor:<tag>` + `balena-io/helios:<tag>`, stamps pair label (FROM+LABEL, shared blobs), pushes `controlplane-{supervisor,helios}:<sup>-h<hel>`; `:stable` promotion behind explicit input; x64 fallback lane
 - [x] `balena-supervisor.bbappend` — install script + units, enable service and timer
-- [ ] CI: dispatch build-controlplane (v19.0.8 + 0.25.28) — verify pair tags + labels land in GHCR, then make packages public
-- [ ] CI: dispatch build-os — verify bitbake integration of new files
+- [x] CI: build-controlplane (run 32269113151) — pair tags verified anonymously in GHCR (linux/arm64, pair labels correct, packages already public)
+- [x] CI: build-os (run 32269115962) — full pipeline green both machines
 - [ ] Device: canary `update-controlplane v19.0.8-h0.25.28`, then promote `:stable`, confirm timer convergence on a second device
