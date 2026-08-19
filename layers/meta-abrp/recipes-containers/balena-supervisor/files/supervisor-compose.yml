@@ -11,10 +11,12 @@
 #  - The io.balena.features.* labels are inert outside supervisor-managed
 #    releases, so the env/mounts they would inject are declared explicitly.
 #    Runtime values are interpolated from /run/supervisor-compose.env
-#    (see supervisor-compose-env.sh).
+#    (see supervisor-compose-env.sh). The image reference itself is
+#    interpolated from the same env file: build-time HELIOS_VERSION default,
+#    runtime override via /mnt/state/supervisor-compose.override.
 name: supervisor
 
-x-helios-image: &helios-image ghcr.io/balena-io/helios:@HELIOS_VERSION@
+x-helios-image: &helios-image ${HELIOS_IMAGE:?set by supervisor-compose-env.sh}
 
 services:
   # Next generation supervisor service. When started it takes over the

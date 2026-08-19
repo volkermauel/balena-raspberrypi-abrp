@@ -20,19 +20,31 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 # Helios version is global (meta-abrp layer.conf fallback, local.conf pin),
 # following the SUPERVISOR_VERSION convention
+#
+# update-controlplane applies supervisor+helios pair releases from
+# ghcr.io/volkermauel/controlplane-{supervisor,helios}: explicit pair
+# tags for canary/rollback, the :stable channel via a daily timer.
+# Pairing and labels: .github/workflows/build-controlplane.yml
 
 SRC_URI:append = " \
     file://supervisor-compose.yml \
     file://balena-supervisor-next.service \
     file://supervisor-compose-env.sh \
+    file://update-controlplane \
+    file://update-controlplane.service \
+    file://update-controlplane.timer \
     "
 
 SYSTEMD_SERVICE:${PN} += "balena-supervisor-next.service"
+SYSTEMD_SERVICE:${PN} += "update-controlplane.service update-controlplane.timer"
 
 RDEPENDS:${PN} += "docker-compose"
 
 do_install:append() {
     install -d ${D}${sysconfdir}/balena-supervisor
+    # Render the build-time HELIOS_VERSION default into both the compose
+    # file and the env generator (the runtime override in
+    # /mnt/state/supervisor-compose.override takes precedence on device)
     sed -e "s,@HELIOS_VERSION@,${HELIOS_VERSION},g" \
         ${WORKDIR}/supervisor-compose.yml \
         > ${D}${sysconfdir}/balena-supervisor/supervisor-compose.yml
@@ -40,6 +52,15 @@ do_install:append() {
 
     install -m 0644 ${WORKDIR}/balena-supervisor-next.service \
         ${D}${systemd_unitdir}/system/balena-supervisor-next.service
-    install -m 0755 ${WORKDIR}/supervisor-compose-env.sh \
-        ${D}${bindir}/supervisor-compose-env.sh
+    sed -e "s,@HELIOS_VERSION@,${HELIOS_VERSION},g" \
+        ${WORKDIR}/supervisor-compose-env.sh \
+        > ${D}${bindir}/supervisor-compose-env.sh
+    chmod 0755 ${D}${bindir}/supervisor-compose-env.sh
+
+    install -m 0755 ${WORKDIR}/update-controlplane \
+        ${D}${bindir}/update-controlplane
+    install -m 0644 ${WORKDIR}/update-controlplane.service \
+        ${D}${systemd_unitdir}/system/update-controlplane.service
+    install -m 0644 ${WORKDIR}/update-controlplane.timer \
+        ${D}${systemd_unitdir}/system/update-controlplane.timer
 }

@@ -30,3 +30,15 @@
 - [x] Render entry.sh placeholder and verify resulting image ref
 - [x] GitHub CI (run 32258564461: both machines green after 3 fix iterations — see design.md) (`build-os.yml` → `yocto-build-deploy.yml`, machines raspberrypi4-64/raspberrypi5, `-t layers/meta-abrp/conf/samples`): bitbake parse + full image build — covered by the existing pipeline once pushed
 - [ ] Device smoke test: unit active, both containers running, supervisor reports via proxy, takeover keys present in DB
+
+## 6. Control plane remote updates
+
+- [x] `files/supervisor-compose.yml` — image ref via `${HELIOS_IMAGE:?}` from env file (build-time default, runtime override)
+- [x] `files/supervisor-compose-env.sh` — `/mnt/state/supervisor-compose.override` sourcing with subshell validation + charset guard, `HELIOS_IMAGE` exported to env file
+- [x] `files/update-controlplane` — pair updater: pull both, verify `io.abrp.controlplane.version` labels match, apply core via `update-balena-supervisor`, core-next via override + unit restart; `--check` (channel), `<tag>` (canary/rollback), `--status`
+- [x] `files/update-controlplane.{service,timer}` — daily channel follow (OnBootSec=20min, OnUnitInactiveSec=1d)
+- [x] `.github/workflows/build-controlplane.yml` — pair CI: pulls `aarch64-supervisor:<tag>` + `balena-io/helios:<tag>`, stamps pair label (FROM+LABEL, shared blobs), pushes `controlplane-{supervisor,helios}:<sup>-h<hel>`; `:stable` promotion behind explicit input; x64 fallback lane
+- [x] `balena-supervisor.bbappend` — install script + units, enable service and timer
+- [ ] CI: dispatch build-controlplane (v19.0.8 + 0.25.28) — verify pair tags + labels land in GHCR, then make packages public
+- [ ] CI: dispatch build-os — verify bitbake integration of new files
+- [ ] Device: canary `update-controlplane v19.0.8-h0.25.28`, then promote `:stable`, confirm timer convergence on a second device

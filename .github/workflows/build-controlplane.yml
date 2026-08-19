@@ -1,0 +1,149 @@
+name: build-controlplane
+
+# Bundles a supervisor + helios image pair into one versioned control plane
+# release on GHCR. A control plane version is the pair tag
+# "<supervisor-tag>-h<helios-tag>" (e.g. v19.0.8-h0.25.28), pushed in
+# lockstep to:
+#   ghcr.io/volkermauel/controlplane-supervisor:<pair>
+#   ghcr.io/volkermauel/controlplane-helios:<pair>
+# Both images are stamped with LABEL io.abrp.controlplane.version=<pair>;
+# the device updater (update-controlplane) trusts these labels, never the
+# tags it pulled, so a half-finished channel promote is skipped on device.
+#
+# Pair tags are the only rollback anchor: never delete them.
+#
+# Promotion to the :stable channel (followed daily by
+# update-controlplane.timer on every device) is a separate, explicit step:
+#   1. dispatch with promote-to-stable=false, canary-test the pair tag
+#      (balena ssh <uuid> update-controlplane <pair>)
+#   2. re-dispatch with the same inputs + promote-to-stable=true
+#
+# NOTE: the first push creates the packages as PRIVATE. Flip both to public
+# (package settings page) or devices cannot pull them anonymously.
+
+on:
+  workflow_dispatch:
+    inputs:
+      supervisor-tag:
+        description: 'Existing aarch64-supervisor tag (e.g. v19.0.8, built by build-supervisor.yml)'
+        required: true
+        default: 'v19.0.8'
+      helios-tag:
+        description: 'Upstream balena-io/helios tag (e.g. 0.25.28) paired with this supervisor'
+        required: true
+        default: '0.25.28'
+      promote-to-stable:
+        description: 'Also move the :stable channel tags to this pair'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/volkermauel
+
+jobs:
+  bundle:
+    if: github.event.repository.visibility == 'public'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Compute pair version
+        run: echo "PAIR=${{ inputs.supervisor-tag }}-h${{ inputs.helios-tag }}" >> "$GITHUB_ENV"
+      - name: Login to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and stamp base images
+        run: |
+          set -eu
+          docker pull --platform linux/arm64 "ghcr.io/volkermauel/aarch64-supervisor:${{ inputs.supervisor-tag }}"
+          docker pull --platform linux/arm64 "ghcr.io/balena-io/helios:${{ inputs.helios-tag }}"
+          stamp() {
+            printf 'FROM %s\nLABEL io.abrp.controlplane.version="%s" io.abrp.controlplane.component="%s"\n' \
+              "$1" "$PAIR" "$2" \
+              | docker build --platform linux/arm64 -t "$REGISTRY/controlplane-$2:$PAIR" -
+            docker inspect --format '  {{.Os}}/{{.Architecture}} $PAIR {{index .Config.Labels "io.abrp.controlplane.version"}}' \
+              "$REGISTRY/controlplane-$2:$PAIR"
+          }
+          stamp "ghcr.io/volkermauel/aarch64-supervisor:${{ inputs.supervisor-tag }}" supervisor
+          stamp "ghcr.io/balena-io/helios:${{ inputs.helios-tag }}" helios
+      - name: Push controlplane pair
+        run: |
+          set -eu
+          docker push "$REGISTRY/controlplane-supervisor:$PAIR"
+          docker push "$REGISTRY/controlplane-helios:$PAIR"
+      - name: Promote to stable channel
+        if: ${{ inputs.promote-to-stable }}
+        run: |
+          set -eu
+          for repo in controlplane-supervisor controlplane-helios; do
+            docker tag "$REGISTRY/$repo:$PAIR" "$REGISTRY/$repo:stable"
+            docker push "$REGISTRY/$repo:stable"
+          done
+          echo ":stable now points at $PAIR"
+      - name: Remind about package visibility (first push creates private packages)
+        if: always()
+        run: |
+          echo "::warning::New packages start PRIVATE - devices pull anonymously. If these are new, make them public:"
+          echo "::warning::https://github.com/users/volkermauel/packages/container/controlplane-supervisor/settings"
+          echo "::warning::https://github.com/users/volkermauel/packages/container/controlplane-helios/settings"
+      - name: Logout from GHCR (self-hosted runner hygiene)
+        if: always()
+        run: docker logout ghcr.io || true
+
+  bundle-fallback:
+    needs: bundle
+    if: >-
+      failure() &&
+      github.event.repository.visibility == 'public'
+    runs-on: [self-hosted, X64, yocto]
+    steps:
+      - name: Compute pair version
+        run: echo "PAIR=${{ inputs.supervisor-tag }}-h${{ inputs.helios-tag }}" >> "$GITHUB_ENV"
+      - name: Login to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and stamp base images
+        run: |
+          set -eu
+          docker pull --platform linux/arm64 "ghcr.io/volkermauel/aarch64-supervisor:${{ inputs.supervisor-tag }}"
+          docker pull --platform linux/arm64 "ghcr.io/balena-io/helios:${{ inputs.helios-tag }}"
+          stamp() {
+            printf 'FROM %s\nLABEL io.abrp.controlplane.version="%s" io.abrp.controlplane.component="%s"\n' \
+              "$1" "$PAIR" "$2" \
+              | docker build --platform linux/arm64 -t "$REGISTRY/controlplane-$2:$PAIR" -
+            docker inspect --format '  {{.Os}}/{{.Architecture}} $PAIR {{index .Config.Labels "io.abrp.controlplane.version"}}' \
+              "$REGISTRY/controlplane-$2:$PAIR"
+          }
+          stamp "ghcr.io/volkermauel/aarch64-supervisor:${{ inputs.supervisor-tag }}" supervisor
+          stamp "ghcr.io/balena-io/helios:${{ inputs.helios-tag }}" helios
+      - name: Push controlplane pair
+        run: |
+          set -eu
+          docker push "$REGISTRY/controlplane-supervisor:$PAIR"
+          docker push "$REGISTRY/controlplane-helios:$PAIR"
+      - name: Promote to stable channel
+        if: ${{ inputs.promote-to-stable }}
+        run: |
+          set -eu
+          for repo in controlplane-supervisor controlplane-helios; do
+            docker tag "$REGISTRY/$repo:$PAIR" "$REGISTRY/$repo:stable"
+            docker push "$REGISTRY/$repo:stable"
+          done
+          echo ":stable now points at $PAIR"
+      - name: Remind about package visibility (first push creates private packages)
+        if: always()
+        run: |
+          echo "::warning::New packages start PRIVATE - devices pull anonymously. If these are new, make them public:"
+          echo "::warning::https://github.com/users/volkermauel/packages/container/controlplane-supervisor/settings"
+          echo "::warning::https://github.com/users/volkermauel/packages/container/controlplane-helios/settings"
+      - name: Logout from GHCR (self-hosted runner hygiene)
+        if: always()
+        run: docker logout ghcr.io || true

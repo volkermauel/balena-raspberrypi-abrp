@@ -46,3 +46,27 @@ The deployment SHALL be reversible: removing the composition restores direct sup
 
 - **WHEN** an operator disables `balena-supervisor-next.service`, removes the helios containers, deletes `apiEndpointOverride` and `listenPortOverride` from the supervisor config database, and restarts `balena-supervisor.service`
 - **THEN** the supervisor listens on its standard port and communicates with the API directly
+
+### Requirement: Control Plane Remote Updates
+
+The OS image SHALL ship an updater (`update-controlplane`) that applies a supervisor+helios version pair remotely, and a daily timer that follows the `:stable` channel tag, without reflashing. Pair integrity SHALL be verified via image labels before anything is applied.
+
+#### Scenario: Channel follow (push promotion)
+
+- **WHEN** CI promotes a pair to `:stable` on both `controlplane-supervisor` and `controlplane-helios`
+- **THEN** each device's daily `update-controlplane.timer` tick pulls both `:stable` images, finds their `io.abrp.controlplane.version` labels equal, and applies the pair (pull-verify-then-apply; no partial application)
+
+#### Scenario: Half-finished promote is skipped
+
+- **WHEN** the two `:stable` tags resolve to different pairs (mid-push)
+- **THEN** the updater logs a warning, changes nothing, and retries on the next tick
+
+#### Scenario: Explicit update and rollback (canary)
+
+- **WHEN** an operator runs `update-controlplane <pair-tag>` over SSH
+- **THEN** that pair is applied immediately on that device only; an older pair tag can be re-applied to roll back, provided pair tags are never deleted from the registry
+
+#### Scenario: Helios image runtime override
+
+- **WHEN** `/mnt/state/supervisor-compose.override` contains `HELIOS_IMAGE=<ref>`
+- **THEN** the composition starts that image instead of the build-time `HELIOS_VERSION` default, after charset validation, and with the build-time default as fallback on any validation failure

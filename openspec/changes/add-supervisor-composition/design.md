@@ -46,3 +46,65 @@ Upstream (balenaCloud) deploys supervisor v19 as a multi-container release throu
 ## Build-time sizing note
 
 `do_image_size_check` (image-balena.bbclass) requires preloaded docker content + /boot to fit into the spare rootfs during HUP. Preloading helios (~62 MiB) plus the docker-compose binary on the rootfs (~46 MiB) exceeded the 320 MiB default rootfs free space on raspberrypi4-64 (CI 32236161266: 311296 KiB required vs 274432 KiB available). Fixed with `layers/meta-abrp/recipes-core/images/balena-image.bbappend` setting `IMAGE_ROOTFS_SIZE:raspberrypi4-64 = "${@balena_rootfs_size(d) + 98304}"` (+96 MiB, machine-scoped). Note: `IMAGE_ROOTFS_EXTRA_SPACE` is the wrong knob — `balena-image.bb` derives `IMAGE_ROOTFS_MAXSIZE = IMAGE_ROOTFS_SIZE` without the extra space, so `do_image_docker` rejects the grown rootfs (CI 32241360449). raspberrypi5 (640 MiB rootfs) passed unmodified.
+
+## Control plane remote updates
+
+### Problem
+
+openBalena has no `/v6/supervisor_release`, so the OS-baked supervisor pin
+never advances remotely, and helios was pinned at build time. Worse, the two
+images form a pair (helios 0.25.28 ships with supervisor v19.0.8): updating
+them independently risks takeover incompatibility. The requirement: push a
+versioned *pair* to the fleet remotely, without reflashing and without
+openBalena changes.
+
+### Scheme: shared pair tag + labels (chosen)
+
+CI (`build-controlplane.yml`) publishes both images under one version:
+
+    controlplane-supervisor:v19.0.8-h0.25.28
+    controlplane-helios:v19.0.8-h0.25.28
+
+Both are `FROM <base>` + `LABEL io.abrp.controlplane.version=<pair>`
+rebuilds: one config layer, zero new bytes (blobs are content-addressed and
+shared with the base images; on-device pulls after the first are manifest
+checks only).
+
+Alternatives rejected:
+- *Scratch bundle image with tarballs* — self-contained but doubles registry
+  bytes and needs tar extraction plumbing on device.
+- *OCI image index with annotated children* — no duplication but requires
+  registry-API manifest walking (token auth, Accept headers) on device, and
+  a plain `balena pull` of such an index is ambiguous.
+- *openBalena supervisor_release endpoint* — would resurrect the balena-cloud
+  push model but diverges the backend (Route A decision was: device-side).
+
+### Device updater (`update-controlplane`)
+
+- `--check` (timer, daily): pull both `:stable`, read labels. Labels
+  disagree → skip (mid-push straddle, retries next tick). Pair equals
+  `/mnt/state/controlplane-version` → no-op. Else apply.
+- `<pair-tag>` (SSH): pull both pair tags, labels must match each other.
+- Apply order: pull+verify everything first (zero interruption while
+  downloading) → `update-balena-supervisor -i controlplane-supervisor:<pair>`
+  (rewrites supervisor.conf on the state partition, restarts core) → write
+  `HELIOS_IMAGE=controlplane-helios:<pair>` to the override → restart
+  `balena-supervisor-next` → record version + `sync -f /mnt/state`.
+- Restarting `balena-supervisor.service` stops `balena-supervisor-next`
+  (systemd Requires= propagation); the updater always re-starts the next
+  unit afterwards, including on the failure path.
+- First tick after flashing: supervisor runs the *labelled* rebuild of the
+  same bytes (different config digest), so expect exactly one core restart
+  while references converge to the controlplane namespace. Subsequent
+  no-op ticks restart nothing.
+
+### Promotion / rollback
+
+1. Dispatch build-controlplane (promote=false) → canary:
+   `balena ssh <uuid> update-controlplane <pair>`.
+2. Re-dispatch with promote=true → `:stable` moves → fleet converges within
+   ~24h (OnUnitInactiveSec=1d, RandomizedDelaySec=3600).
+3. Rollback: re-dispatch promote with the old pair (or SSH per device).
+   Pair tags are the only rollback anchor — never delete them.
+4. GHCR packages are created PRIVATE on first push; flip to public in the
+   package settings or devices cannot pull anonymously.

@@ -58,6 +58,36 @@ fi
 # Host OS metadata (best effort, used by helios for reporting/HUP)
 OS_VERSION=$(sed -n 's/^VERSION_ID="\(.*\)"/\1/p' /etc/os-release 2>/dev/null || true)
 
+
+# Helios image: build-time default (rendered from HELIOS_VERSION), with an
+# optional runtime override from the state partition. The override survives
+# reboots and host OS updates without reflashing:
+#   echo 'HELIOS_IMAGE=ghcr.io/balena-io/helios:0.26.0' \
+#       > /mnt/state/supervisor-compose.override
+#   systemctl restart balena-supervisor-next
+# A new tag is pulled automatically by compose (default pull policy
+# "missing"; the build-time default is preloaded for offline first boot).
+OVERRIDE_FILE=/mnt/state/supervisor-compose.override
+HELIOS_IMAGE="ghcr.io/balena-io/helios:@HELIOS_VERSION@"
+if [ -f "$OVERRIDE_FILE" ]; then
+    # Validate in a subshell first: a syntax error or unset-variable
+    # reference inside a sourced file would abort this script
+    if ( . "$OVERRIDE_FILE" ) 2>/dev/null; then
+        # shellcheck disable=SC1090
+        . "$OVERRIDE_FILE"
+        echo "Using HELIOS_IMAGE override from $OVERRIDE_FILE"
+    else
+        echo "WARNING: $OVERRIDE_FILE failed validation, using build-time default" >&2
+    fi
+fi
+# Reject empty or unsafe values (whitespace/newlines would corrupt the
+# env file); image references use this charset (host[:port]/path:tag@digest)
+case "$HELIOS_IMAGE" in
+    *[!A-Za-z0-9._:/@-]*|'')
+        echo "WARNING: rejecting unsafe HELIOS_IMAGE value, using build-time default" >&2
+        HELIOS_IMAGE="ghcr.io/balena-io/helios:@HELIOS_VERSION@"
+        ;;
+esac
 umask 077
 cat > "$ENV_FILE" <<EOF
 BALENA_DEVICE_UUID=${UUID}
@@ -67,6 +97,7 @@ BALENA_SUPERVISOR_HOST=10.114.104.1
 BALENA_SUPERVISOR_PORT=${LISTEN_PORT}
 BALENA_SUPERVISOR_API_KEY=${SUPERVISOR_API_KEY}
 BALENA_HOST_OS_VERSION=${OS_VERSION}
+HELIOS_IMAGE=${HELIOS_IMAGE}
 EOF
 
 echo "Supervisor composition environment ready"
