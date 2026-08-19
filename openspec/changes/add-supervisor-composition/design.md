@@ -42,3 +42,7 @@ Upstream (balenaCloud) deploys supervisor v19 as a multi-container release throu
 - Compose v5 CLI behavior verified locally with the exact binary; aarch64 checksum pinned from the release's `.sha256` asset.
 - `docker compose down` leaves `supervisor0` untouched (declared `external: true`).
 - If the supervisor regenerates its API key (e.g. `/v1/regenerate-api-key`), the env file is stale for that boot; next boot re-extracts it. Takeover itself is unaffected.
+
+## Build-time sizing note
+
+`do_image_size_check` (image-balena.bbclass) requires preloaded docker content + /boot to fit into the spare rootfs during HUP. Preloading helios (~62 MiB) plus the docker-compose binary on the rootfs (~46 MiB) exceeded the 320 MiB default rootfs free space on raspberrypi4-64 (CI 32236161266: 311296 KiB required vs 274432 KiB available). Fixed with `layers/meta-abrp/recipes-core/images/balena-image.bbappend` setting `IMAGE_ROOTFS_EXTRA_SPACE = "98304"` (96 MiB), a bbappend so it overrides the recipe's `= "0"` assignment.
