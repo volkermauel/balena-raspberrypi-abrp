@@ -28,5 +28,5 @@
 - [x] `sh -n` on all shipped shell scripts (raw and @HELIOS_VERSION@-rendered)
 - [x] Render supervisor-compose.yml and validate with the exact compose v5.5.0 binary (`docker-compose config`)
 - [x] Render entry.sh placeholder and verify resulting image ref
-- [ ] GitHub CI (`build-os.yml` → `yocto-build-deploy.yml`, machines raspberrypi4-64/raspberrypi5, `-t layers/meta-abrp/conf/samples`): bitbake parse + full image build — covered by the existing pipeline once pushed
+- [x] GitHub CI (run 32258564461: both machines green after 3 fix iterations — see design.md) (`build-os.yml` → `yocto-build-deploy.yml`, machines raspberrypi4-64/raspberrypi5, `-t layers/meta-abrp/conf/samples`): bitbake parse + full image build — covered by the existing pipeline once pushed
 - [ ] Device smoke test: unit active, both containers running, supervisor reports via proxy, takeover keys present in DB
