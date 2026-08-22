@@ -1,0 +1,10 @@
+[Unit]
+Description=Balena control plane updater (supervisor core + helios core-next)
+Documentation=https://github.com/volkermauel/balena-raspberrypi-abrp
+Requires=balena.service
+After=balena.service balena-net-connectivity-wait.target
+Wants=balena-net-connectivity-wait.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/update-controlplane --check

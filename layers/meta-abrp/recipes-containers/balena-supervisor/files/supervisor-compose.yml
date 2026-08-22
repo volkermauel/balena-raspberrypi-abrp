@@ -1,0 +1,98 @@
+# Supervisor composition: core-next (helios) + service-relay.
+#
+# Rendered at build time (meta-abrp balena-supervisor.bbappend substitutes
+# @HELIOS_VERSION@). Mirrors upstream balena-supervisor v19's
+# docker-compose.yml, with two deviations required by our device-side
+# deployment:
+#
+#  - `core` is NOT part of this composition. It is started as the single
+#    container `balena_supervisor` by balena-supervisor.service
+#    (start-balena-supervisor), which is what the helios takeover expects.
+#  - The io.balena.features.* labels are inert outside supervisor-managed
+#    releases, so the env/mounts they would inject are declared explicitly.
+#    Runtime values are interpolated from /run/supervisor-compose.env
+#    (see supervisor-compose-env.sh). The image reference itself is
+#    interpolated from the same env file: build-time HELIOS_VERSION default,
+#    runtime override via /mnt/state/supervisor-compose.override.
+name: supervisor
+
+x-helios-image: &helios-image ${HELIOS_IMAGE:?set by supervisor-compose-env.sh}
+
+services:
+  # Next generation supervisor service. When started it takes over the
+  # legacy supervisor (proxy for API and container traffic) and enables
+  # e.g. queued host OS updates.
+  core-next:
+    image: *helios-image
+    # Without this service the composition is useless, always restart
+    restart: always
+    # Required to distinguish between stderr/stdout, the supervisor defaults to true
+    tty: false
+    environment:
+      # Feature: io.balena.features.dbus (needed to restart the supervisor
+      # service during takeover)
+      DBUS_SYSTEM_BUS_ADDRESS: unix:path=/host/run/dbus/system_bus_socket
+      # Feature: io.balena.features.balena-socket
+      DOCKER_HOST: unix:///var/run/balena-engine.sock
+      # Needed for locks and balenahup. This needs to match the path
+      # used for the `runtime` volume
+      BALENA_HOST_RUNTIME_DIR: /tmp
+      # Only send error logs to dashboard
+      BALENA_LOGS_LEVEL: error
+      # Feature: io.balena.features.balena-api
+      BALENA_API_URL: ${BALENA_API_URL:?set by supervisor-compose-env.sh}
+      BALENA_API_KEY: ${BALENA_API_KEY:?set by supervisor-compose-env.sh}
+      # Feature: io.balena.features.supervisor-api
+      BALENA_SUPERVISOR_HOST: 10.114.104.1
+      BALENA_SUPERVISOR_PORT: ${BALENA_SUPERVISOR_PORT:-48484}
+      BALENA_SUPERVISOR_API_KEY: ${BALENA_SUPERVISOR_API_KEY:?set by supervisor-compose-env.sh}
+      # Device identity and host metadata
+      BALENA_DEVICE_UUID: ${BALENA_DEVICE_UUID:?set by supervisor-compose-env.sh}
+      BALENA_HOST_OS_VERSION: ${BALENA_HOST_OS_VERSION:-}
+    volumes:
+      # Critical configurations
+      - config:/config/helios
+      # Request caching
+      - cache:/cache/helios
+      # Persistent system state data that can be reconstructed from
+      # the target state
+      - state:/local/helios
+      # Runtime directory. Data here does not persist after reboots
+      - runtime:/tmp/run
+      # io.balena.features.balena-socket
+      - /var/run/balena-engine.sock:/var/run/balena-engine.sock
+      # io.balena.features.dbus
+      - /run/dbus/system_bus_socket:/host/run/dbus/system_bus_socket
+    networks:
+      # Supervisor-owned network (10.114.104.0/25, gw 10.114.104.1), on
+      # which the supervisor API listens after takeover (10.114.104.1:48480).
+      # Ensured by supervisor-compose-env.sh or the supervisor itself.
+      - supervisor0
+
+  # Relays requests between tcp port 48484 and the unix socket exposed by
+  # the core-next service
+  service-relay:
+    image: *helios-image
+    command: socat TCP-LISTEN:48484,reuseaddr,fork UNIX-CONNECT:/tmp/run/helios.sock
+    restart: always
+    tty: false
+    ports:
+      - '48484:48484'
+    volumes:
+      - runtime:/tmp/run
+    environment:
+      # Socat errors are not really useful, don't send them to the dashboard
+      BALENA_LOGS_LEVEL: none
+    healthcheck:
+      test: ['CMD', 'wget', '-O', '-', '-q', 'http://127.0.0.1:48484/ping']
+
+networks:
+  supervisor0:
+    external: true
+    name: supervisor0
+
+volumes:
+  config:
+  cache:
+  state:
+  runtime:
