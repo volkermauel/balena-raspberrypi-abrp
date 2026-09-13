@@ -1,0 +1,351 @@
+name: build-os
+
+# abrp: caller for the patched yocto-build-deploy.yml. Manual dispatch for a
+# specific upstream version tag, or scheduled (every 6 h) auto-detection of
+# upstream tags not yet published as hostapp images on GHCR (GitHub-only
+# signal — no balenaCloud, no private infra). Releases reach openBalena via
+# the k8s-repo import script (scripts/import-hostapp-release.sh), NOT from
+# this pipeline.
+#
+# Auto-build of NEW upstream versions: forks do not inherit upstream
+# tags/releases, so instead of fork-sync machinery the `sync` job runs the
+# additive-tree sync (scripts/sync-upstream.sh) IN CI: it fetches the missing
+# upstream tag, re-applies our layer/workflows onto it as ONE commit on
+# branch auto/<tag>, and pushes branch + tag with the plain GITHUB_TOKEN
+# (jobs in the same run can then check that ref out — no trigger chain, no
+# PAT, no App). One missing version per run (the newest); older ones follow
+# in subsequent runs. A version already in GHCR is never rebuilt.
+#
+# Runner strategy: primary on GitHub-hosted runners via the repo variable
+# YOCTO_PRIMARY_RUNS_ON (JSON label array, e.g. '["linux-x64-16core"]'). Until
+# that var is set (larger runners exist + billing), it defaults to the
+# self-hosted runner set — a build never queues on a non-existent runner.
+# If the primary FAILS, the self-hosted runner retries the same machines
+# (artifact-name conflicts from the failed attempt are cleaned up first;
+# -sstate artifacts are kept — they speed up the next attempt).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream device-repo tag to build (e.g. v7.4.0+rev5); empty = abrp-main'
+        required: false
+        type: string
+        default: ''
+      machines:
+        description: 'JSON array of machines'
+        required: false
+        type: string
+        default: '["raspberrypi4-64", "raspberrypi5"]'
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  # callers must grant the UNION of all job-level permissions requested by
+  # yocto-build-deploy.yml (called-workflow jobs cannot elevate) — else startup_failure
+  pull-requests: write
+  contents: read
+  actions: write # delete this run's artifacts before a fallback retry
+  id-token: write
+  packages: read
+
+jobs:
+  detect:
+    if: github.event_name == 'schedule'
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || 'self-hosted' }} # abrp: GH-hosted only when public
+    outputs:
+      versions: ${{ steps.cmp.outputs.versions }}
+      target: ${{ steps.cmp.outputs.target }}
+    steps:
+      - id: cmp
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          MACHINES='["raspberrypi4-64", "raspberrypi5"]'
+          # upstream tags ARE the versions (verified: tag commit msg == version)
+          tags=$(git ls-remote --tags --refs https://github.com/balena-os/balena-raspberrypi | cut -d/ -f3)
+          # floor at v7.4.0+rev5: rev4 is already built/imported; oldest-first
+          # below then picks rev5 (HUP pair partner) before newer 2026.x tags
+          ups=$(echo "$tags" | grep -E '^v[0-9]+\.' | grep -vE '\+rev0$' | sort -uV | sed -n '/^v7\.4\.0+rev5$/,$p' || true)
+
+          # what we already published: a version counts as built only when a
+          # hostapp image tag exists for EVERY machine (partial = rebuild).
+          # GHCR tags use '-' where the version has '+' (7.4.0-rev4).
+          # Packages may not exist yet -> empty lists, never a crash.
+          have=""
+          for m in $(echo "$MACHINES" | jq -r '.[]'); do
+            tok=$(curl -s -u "${OWNER}:${GH_TOKEN}" \
+              "https://ghcr.io/token?scope=repository:${OWNER}/balenaos-hostapp/${m}:pull" \
+              | jq -r '.token // empty' 2>/dev/null || true)
+            v=""
+            if [ -n "$tok" ] && [ "$tok" != "null" ]; then
+              v=$(curl -s -H "Authorization: Bearer ${tok}" \
+                "https://ghcr.io/v2/${OWNER}/balenaos-hostapp/${m}/tags/list?n=1000" \
+                | jq -r '.tags[]?' 2>/dev/null | sed 's/-rev/+rev/' | sed 's/^/v/' | sort -uV || true)
+            fi
+            if [ -z "$have" ]; then have="$v"; else have=$(grep -Fxf <(echo "$v" | grep . || true) <(echo "$have" | grep . || true) || true); fi
+          done
+
+          # set difference via grep (NOT comm: sort -V order != byte order for
+          # v7 vs v2026 major versions, which breaks comm); ups order preserved
+          missing=$(grep -Fxvf <(echo "$have" | grep . || true) <(echo "$ups" | grep . || true) || true)
+          echo "upstream(floor): $(echo "$ups" | grep -c . || true); have: $(echo "$have" | grep -c . || true); missing: $(echo "$missing" | grep . | tr '\n' ' ')"
+          versions=$(echo "$missing" | jq -R -s -c 'split("\n") | map(select(length>0))')
+          # one per run, OLDEST first: versions build in order (HUP chain)
+          target=$(echo "$missing" | grep . | head -1 || true)
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+
+  sync:
+    # Bring the target upstream tag into THIS repo with our additive tree on
+    # branch auto/<tag> (single commit on top of the tag, like abrp-main).
+    # Also serves manual dispatch with an unsynced version input.
+    needs: detect
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'schedule' || needs.detect.result == 'success') &&
+      (inputs.version != '' || needs.detect.outputs.target != '')
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || 'self-hosted' }} # abrp: GH-hosted only when public
+    permissions:
+      contents: write # push auto/<tag> branch + the upstream tag object
+    outputs:
+      ref: ${{ steps.out.outputs.ref }}
+    steps:
+      - name: Checkout abrp-main (full history + submodules)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: abrp-main
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Sync upstream tag + abrp additive tree
+        env:
+          TARGET: ${{ inputs.version || needs.detect.outputs.target }}
+        run: |
+          set -euo pipefail
+          git config user.name 'abrp-ci'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python3 -c 'import yaml' 2>/dev/null || pip install --user --break-system-packages pyyaml
+          scripts/sync-upstream.sh "$TARGET" "auto/$TARGET"
+
+      - name: Push branch + tag
+        env:
+          TARGET: ${{ inputs.version || needs.detect.outputs.target }}
+        run: |
+          set -euo pipefail
+          git push origin --force "refs/heads/auto/${TARGET}"
+          # tag was re-created by sync-upstream.sh at OUR sync commit (upstream
+          # tag objects carry upstream workflows -> App tokens can't push them)
+          git push origin --force "refs/tags/${TARGET}"
+
+      - id: out
+        env:
+          TARGET: ${{ inputs.version || needs.detect.outputs.target }}
+        run: echo "ref=auto/${TARGET}" >> "$GITHUB_OUTPUT"
+
+  yocto:
+    needs: [detect, sync]
+    if: >-
+      always() && !cancelled() &&
+      (needs.sync.result == 'success' || needs.sync.result == 'skipped') &&
+      (github.event_name != 'schedule' || needs.detect.result == 'success') &&
+      (needs.detect.outputs.versions != '[]' || inputs.version != '')
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '["raspberrypi4-64", "raspberrypi5"]') }}
+    uses: ./.github/workflows/yocto-build-deploy.yml
+    secrets: inherit
+    with:
+      machine: ${{ matrix.machine }}
+      device-repo: ${{ github.repository }}
+      # auto/<tag> (synced upstream tag + our delta; git describe derives the
+      # os version from the tag) or plain abrp-main for master builds
+      device-repo-ref: ${{ needs.sync.outputs.ref || 'abrp-main' }}
+      # GitHub-hosted larger runners (set repo var YOCTO_PRIMARY_RUNS_ON to a
+      # JSON label array once they exist) or the self-hosted set. On GH-hosted
+      # runners sstate rides cross-run artifacts (see P21); free-tier runners
+      # cannot fit Yocto (disk + 6h cap) — use larger runners there.
+      build-runs-on: ${{ vars.YOCTO_PRIMARY_RUNS_ON || '["self-hosted", "X64", "yocto"]' }}
+      # our meta-abrp layer via barys --templates-path (validated input passthrough)
+      build-args: '-t layers/meta-abrp/conf/samples'
+      test_matrix: ''
+
+  # A failed primary still leaves per-machine artifacts (upload-artifact v4+
+  # hard-fails on same-name conflicts within a run). Delete everything except
+  # -sstate — if the primary saved sstate before dying, the fallback (and the
+  # next GH-hosted attempt) benefits from it.
+  cleanup-failed-attempt:
+    needs: yocto
+    if: >-
+      always() && !cancelled() &&
+      needs.yocto.result != 'success' &&
+      needs.yocto.result != 'skipped' &&
+      needs.yocto.result != 'cancelled'
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || 'self-hosted' }} # abrp: GH-hosted only when public
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '["raspberrypi4-64", "raspberrypi5"]') }}
+    steps:
+      - name: Delete failed attempt's artifacts (keep -sstate)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ids=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"${{ matrix.machine }}-\")) | select(.name | endswith(\"-sstate\") | not) | .id")
+          for id in $ids; do
+            echo "deleting artifact ${id}"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}"
+          done
+          echo "cleanup done for ${{ matrix.machine }}"
+
+  yocto-fallback:
+    needs: [yocto, cleanup-failed-attempt, sync]
+    if: >-
+      always() && !cancelled() &&
+      needs.cleanup-failed-attempt.result == 'success' &&
+      needs.yocto.result != 'success' &&
+      needs.yocto.result != 'skipped' &&
+      needs.yocto.result != 'cancelled'
+    strategy:
+      fail-fast: false
+      matrix:
+        machine: ${{ fromJSON(inputs.machines || '["raspberrypi4-64", "raspberrypi5"]') }}
+    uses: ./.github/workflows/yocto-build-deploy.yml
+    secrets: inherit
+    with:
+      machine: ${{ matrix.machine }}
+      device-repo: ${{ github.repository }}
+      device-repo-ref: ${{ needs.sync.outputs.ref || 'abrp-main' }}
+      build-runs-on: '["self-hosted", "X64", "yocto"]'
+      build-args: '-t layers/meta-abrp/conf/samples'
+      test_matrix: ''
+
+  publish:
+    needs: [yocto, yocto-fallback]
+    if: >-
+      always() && !cancelled() &&
+      (needs.yocto.result == 'success' || needs.yocto-fallback.result == 'success')
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || 'self-hosted' }} # abrp: GH-hosted only when public
+    strategy:
+      matrix:
+        machine: ['raspberrypi4-64', 'raspberrypi5']
+    permissions:
+      packages: write
+      actions: read
+    steps:
+      - name: Download hostapp image artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ${{ matrix.machine }}-balena-image.docker
+          path: img
+
+      - name: Download hostapp metadata (VERSION)
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ${{ matrix.machine }}-hostapp-artifacts
+          path: meta
+
+      - name: Push to GHCR (public)
+        env:
+          GHCR_OWNER: ${{ github.repository_owner }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # docker save emits "Loaded image ID: sha256:..." for digest-only archives
+          ref=$(docker load -i img/balena-image.docker | cut -d: -f1 --complement | tr -d " ")
+          # VERSION holds the supervisor version; VERSION_HOSTOS the OS version
+          version=$(cat meta/VERSION_HOSTOS | tr '+' '-')
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GHCR_OWNER" --password-stdin
+          docker tag "$ref" "ghcr.io/$GHCR_OWNER/balenaos-hostapp/${{ matrix.machine }}:$version"
+          docker push "ghcr.io/$GHCR_OWNER/balenaos-hostapp/${{ matrix.machine }}:$version"
+
+      - name: Docker logout (runner hygiene)
+        # abrp: docker login persists to ~/.docker/config.json on the runner;
+        # an expired run-scoped token there poisons ALL anonymous ghcr.io
+        # pulls on that host (observed: helper image 'denied: denied').
+        # Same hygiene step as build-supervisor.yml.
+        if: always()
+        run: docker logout ghcr.io || true
+
+      - name: Note flashable image location
+        run: |
+          echo "Flashable .img zips are published to the GitHub Releases tab by the"
+          echo "os-release job (bootstrap without balenaCloud)."
+
+  os-release:
+    # abrp: publish flashable .img zips to the GitHub Releases tab so devices
+    # can bootstrap without balenaCloud's image index. Idempotent: re-uploads
+    # (clobber) if the release already exists.
+    needs: publish
+    if: always() && needs.publish.result == 'success'
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || 'self-hosted' }} # abrp: GH-hosted only when public
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download flashable images
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: '*-balena.img.zip'
+          path: rel
+
+      - name: Download version metadata
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: '*-hostapp-artifacts'
+          path: meta
+
+      - name: Create GitHub release with flashable images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # version file inside each <machine>-hostapp-artifacts/ subdir
+          # VERSION holds the supervisor version; VERSION_HOSTOS the OS version
+          ver=$(cat "$(find meta -maxdepth 2 -name VERSION_HOSTOS | head -1)")
+          echo "os_version: ${ver}"
+          tag="v${ver}"
+
+          mkdir -p assets && cd assets
+          for d in ../rel/*/; do
+            d=${d%/}
+            m=$(basename "$d"); m=${m%-balena.img.zip}
+            cp "${d}/balena.img.zip" "balenaos-${ver}-${m}.img.zip"
+          done
+          sha256sum balenaos-*.img.zip > SHA256SUMS
+          ls -lh
+
+          cat > notes.md <<NOTES
+          Self-built balenaOS **${ver}** — zero-balenaCloud build. Supervisor
+          **v19.0.8** from \`ghcr.io\` (see the Build & push supervisor image workflow).
+
+          Hostapp container images: \`ghcr.io/${REPO%/*}/balenaos-hostapp/<machine>:$(echo "${ver}" | tr '+' '-')\`.
+          Serve them to devices from your own openBalena instance via its registry
+          (import script in the k8s repo: \`scripts/import-hostapp-release.sh\`).
+
+          ## Flash & join
+
+          \`\`\`bash
+          gh release download '${tag}' -R ${REPO} -O img.zip --clobber \\
+            -p "balenaos-${ver}-raspberrypi4-64.img.zip"
+          unzip img.zip   # -> balena.img
+          # stamp endpoint config (api/vpn/registry), then flash with balenaEtcher
+          \`\`\`
+
+          Built by run ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}
+          NOTES
+
+          if gh release view "$tag" -R "$REPO" >/dev/null 2>&1; then
+            echo "release ${tag} exists — clobber-uploading assets"
+            gh release upload "$tag" SHA256SUMS balenaos-*.img.zip --clobber -R "$REPO"
+          else
+            gh release create "$tag" --latest -R "$REPO" \
+              --title "balenaOS ${ver} (self-built, supervisor v19.0.8)" \
+              --notes-file notes.md SHA256SUMS balenaos-*.img.zip
+          fi

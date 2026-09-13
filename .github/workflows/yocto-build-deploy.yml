@@ -1,0 +1,1528 @@
+name: "Yocto Build-Test-Deploy"
+
+on:
+  workflow_call:
+    secrets:
+      # BALENA_API_DEPLOY_KEY is a secret that should be specific to the runtime environment
+      # It requires permissions to deploy hostApp releases, and fetch supervisor release images (via yocto recipes)
+      BALENA_API_DEPLOY_KEY:
+        description: balena API key for the deploy environment, used for deploying hostApps and fetching supervisor releases
+        required: false
+      # BALENA_API_TEST_KEY is a secret that should be specific to the runtime environment
+      # It requires permissions to manage autokit workers, and create test fleets
+      BALENA_API_TEST_KEY:
+        description: balena API key for the test environment, used for finding autokit workers and creating test fleets
+        required: false
+      # Dockerhub secrets are used only for pulling the helper image for "Prepare files for S3" step - if we simplify this to not use the
+      # helper image, these secrets can be removed
+      DOCKERHUB_USER:
+        description: Dockerhub user for pulling private helper images
+        required: false
+      DOCKERHUB_TOKEN:
+        description: Dockerhub token for pulling private helper images
+        required: false
+      SIGN_KMOD_KEY_APPEND:
+        description: Base64-encoded public key of a kernel module signing keypair
+        required: false
+      # SIGN_API_KEY is a secret that should be specific to the runtime environment
+      # It requires permissions to access the image signing server
+      SIGN_API_KEY:
+        description: balena API key that provides access to the signing server
+        required: false
+      BALENAOS_CI_APP_PRIVATE_KEY:
+        description: "GitHub App private key (PEM) to generate ephemeral tokens (used with vars.BALENAOS_CI_APP_ID). Accepts a raw PEM or base64-encoded value."
+        required: false
+      PBDKF2_PASSPHRASE:
+        description: "Passphrase used to encrypt/decrypt balenaOS assets at rest in GitHub."
+        required: false
+      YOCTO_CACHE_SECRET_KEY:
+        description: "Self-hosted runner S3 secret key for the yocto-svcacct user."
+        required: false
+      YOCTO_SSH_PRIVATE_KEY_B64:
+        description: "SSH key to access balena-os private repositories."
+        required: false
+
+    inputs:
+      build-runs-on:
+        description: The runner labels to use for the build job(s)
+        required: false
+        type: string
+        default: >
+          [
+            "self-hosted",
+            "X64",
+            "yocto"
+          ]
+      device-repo:
+        description: balenaOS device repository (owner/repo)
+        required: false
+        type: string
+        default: ${{ github.repository }}
+      device-repo-ref:
+        description: balenaOS device repository tag, branch, or commit to build
+        required: false
+        type: string
+        default: ${{ github.ref }}
+      meta-balena-ref:
+        description: meta-balena ref if not the currently pinned version
+        required: false
+        type: string
+      yocto-scripts-ref:
+        description: balena-yocto-scripts ref if not the currently pinned version
+        required: false
+        type: string
+      machine:
+        description: yocto board name
+        required: true
+        type: string
+      slug:
+        description: Device type slug to deploy to - defaults to machine name
+        required: false
+        type: string
+      signing-environment:
+        description: The signing environment to use for the bitbake build - includes the related vars and secrets
+        required: false
+        type: string
+        default: ''
+      source-mirror-environment:
+        description: The AWS environment to use for the S3 source mirror - includes related vars and OIDC role(s)
+        required: false
+        type: string
+        default: balena-production.us-east-1
+      # This input exists because we want the option to not auto-finalise for some device types, even if they have tests and those tests pass - for example some custom device types, the customer doesn't want new releases published until they green light it
+      finalize-on-push-if-tests-passed:
+        description: Whether to finalize a hostApp container image to a balena environment, if tests pass.
+        required: false
+        type: boolean
+        default: true # Default behaviour is auto-finalise if tests pass, unless opted out by customer
+      deploy-ami:
+        description: Whether to deploy an AMI to AWS
+        required: false
+        type: boolean
+        default: false # This only works currently for generic-amd64, so default to false, and enable only in the caller workflow for that DT
+      sign-image:
+        description: Whether to sign image for secure boot
+        required: false
+        type: boolean
+        default: false # Always false by default, override on specific device types which this is relevant in the device repo
+      extra_signing_key:
+        description: Whether to verify that an extra kernel module signing key is provided and made it through the kernel build
+        required: false
+        type: boolean
+        default: false
+      build-args:
+        description: Extra barys build arguments
+        required: false
+        type: string
+      # Supported fields for the test matrix:
+      # - test_suite: (required) The test suite to run. The valid test suites are `os`, `hup`, and `cloud`
+      # - environment: (required) The balenaCloud environment to use for testing, e.g. `bm.balena-dev.com` or `balena-cloud.com`
+      # - worker_type: The worker type to use for testing. The valid worker types are `qemu` and `testbot`. The default worker type is `testbot`
+      # - worker_fleets: The testbot fleets for finding available Leviathan workers. Not used for QEMU workers. Can accept a list of apps separated by commas, no spaces in between
+      # - test_org: The organization to use for testing cloud functionality. This default org is `testbot`
+      # - runs_on: A JSON array of runner labels to use for the test job(s). For qemu workers use the labels `["self-hosted", "X64", "kvm"]`.
+      # - secure_boot: (truthy) Enable secure boot testing flags QEMU_SECUREBOOT=1 and FLASHER_SECUREBOOT=1. Default is false.
+      # - test_image: (string) Select the yocto build artifact for use in the test suite. Default to 'balena.img', the artifact specified in the deployArtifact attribute in the coffee file. Can choose 'balena-flasher.img' or 'balena-raw.img' if present
+      # To use specific settings for each test job, create an include array like this...
+      # {"include": [
+      #   {
+      #     "test_suite": "os",
+      #     "environment": "bm.balena-dev.com"
+      #   },
+      #   {
+      #     "test_suite": "cloud",
+      #     "environment": "balena-cloud.com",
+      #     "test_org": "testbot"
+      #   },
+      #   {
+      #     "test_suite": "hup",
+      #     "environment": "balena-cloud.com",
+      #     "worker_type": "qemu",
+      #     "runs_on": ["self-hosted", "X64", "kvm"]
+      #   }
+      # ]}
+      # Alternatively, you can have the matrix run on a combinatorial match on the provided values where every single permutation of the values will be executed ...
+      # {
+      #   "test_suite": ["os","cloud","hup"],
+      #   "environment": ["bm.balena-dev.com"],
+      #   "worker_type": ["qemu","testbot"],
+      #   "runs_on": [["self-hosted", "X64", "kvm"]]
+      # }
+      test_matrix:
+        description: "JSON Leviathan test matrix to use for testing. No tests will be run if not provided."
+        required: false
+        type: string
+
+# https://docs.github.com/en/actions/using-jobs/using-concurrency
+# https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs
+# The following concurrency group cancels in-progress jobs or runs on pull_request events only;
+# if github.head_ref is undefined, the concurrency group will fallback to the run ID,
+# which is guaranteed to be both unique and defined for the run.
+
+# From: https://github.com/orgs/community/discussions/69704#discussioncomment-7803351
+
+# The available contexts for cancel-in-progress expressions are:
+# - github: This context provides access to various GitHub-specific variables,
+#   such as github.event_name, github.ref, and github.workflow.
+# - inputs: This context allows you to access input parameters defined in the workflow.
+#   This is particularly useful for conditional cancellation based on user-specified settings.
+# - vars: This context provides access to workflow-defined variables,
+#   which can be used to store intermediate values or constants.
+# When evaluating expressions for cancel-in-progress, certain parameters may not be available at the time of evaluation.
+# For instance, the github.job context is not accessible, as it's specific to the running job and not the concurrency group.
+
+# Note that we do not use github.ref here, as PRs from forks will have a
+# ref of 'refs/heads/master' and collide with each other. Instead, we use github.head_ref
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}-${{ inputs.machine }}
+  # Cancel jobs in-progress for open PRs, but not merged or closed PRs, by checking for the merge ref.
+  # Note that for pull_request_target events (PRs from forks), the github.ref value is
+  # usually 'refs/heads/master' so we can't rely on that to determine if it is a merge event or not.
+  # As a result pull_request_target events will never cancel in-progress jobs and will be queued instead.
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+env:
+  WORKSPACE: ${{ github.workspace }}
+  MACHINE: ${{ inputs.machine }}
+  SLUG: ${{ inputs.slug || inputs.machine }}
+  VERBOSE: verbose
+  WORKFLOW_NAME: ${{ github.workflow }}
+
+# https://docs.github.com/en/actions/security-guides/automatic-token-authentication
+# https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#permissions
+# https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect#adding-permissions-settings
+permissions: {}
+
+jobs:
+  approved-commit:
+    name: Approved commit
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-24.04' || 'self-hosted' }}  # abrp: GH-hosted only when public
+
+    permissions:
+      pull-requests: write # Write is required to create PR comments for workflow approvals.
+      contents: read
+
+    steps:
+      # Combining pull_request_target workflow trigger with an explicit checkout of an
+      # untrusted PR is a dangerous practice that may lead to repository compromise.
+      # https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+      # This action requires approvals via reactions for each workflow run.
+      # https://github.com/product-os/review-commit-action
+      - name: Wait for approval on pull_request_target events
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.merged != true
+        timeout-minutes: 90
+        uses: product-os/review-commit-action@2e3ac2bf51758d00b7cd8f3bab0c35f65bf120b1 # v0.3.0
+        with:
+          allow-authors: false
+
+  # This job runs first and all other jobs depend on it.
+  # It is responsible for setting up the device-type and fetching the necessary information
+  # to build and deploy the device-type.
+  balena-lib:
+    name: Device info
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-24.04' || 'self-hosted' }}  # abrp: GH-hosted only when public
+    # Depend on approved-commit just so we don't run without approvals
+    needs:
+      - approved-commit
+
+    # This environment requires the following variables:
+    # - BALENA_HOST
+    # This environment requires the following secrets:
+    # - BALENA_API_DEPLOY_KEY - used to authenticate with the balena API
+
+    env:
+      automation_dir: "${{ github.workspace }}/balena-yocto-scripts/automation"
+      BALENARC_BALENA_URL: ${{ vars.BALENA_HOST || vars.BALENARC_BALENA_URL || 'balena-cloud.com' }}
+
+    permissions:
+      actions: read # We are fetching workflow run results of a merge commit when workflow is triggered by new tag, to see if tests pass
+      pull-requests: write # Read is required to fetch the PR that merged, in order to get the test results.
+      contents: read
+
+    defaults:
+      run:
+        working-directory: .
+        shell: bash --noprofile --norc -eo pipefail -x {0}
+
+    outputs:
+      device_slug: ${{ steps.balena-lib.outputs.device_slug }}
+      os_version: ${{ steps.balena-lib.outputs.os_version }}
+      meta_balena_version: ${{ steps.balena-lib.outputs.meta_balena_version }}
+      device_repo_revision: ${{ steps.balena-lib.outputs.device_repo_revision }}
+      yocto_scripts_ref: ${{ steps.balena-lib.outputs.yocto_scripts_ref }}
+      yocto_scripts_version: ${{ steps.balena-lib.outputs.yocto_scripts_version }}
+      deploy_artifact: ${{ steps.balena-lib.outputs.deploy_artifact }}
+      dt_arch: ${{ steps.balena-lib.outputs.dt_arch }}
+      is_private: ${{ steps.is-private.outputs.result }}
+      should_finalize: false  # abrp: hostapp-deploy removed — releases reach openBalena via k8s scripts/import-hostapp-release.sh
+      is_esr: ${{ startsWith(github.ref, 'refs/tags/v20') }}
+      deploy_path: ${{ github.workspace }}/deploy/${{ steps.balena-lib.outputs.device_slug }}/${{ steps.balena-lib.outputs.os_version }}
+      balena_host: ${{ env.BALENARC_BALENA_URL }}
+      build_services: ${{ steps.build-matrix.outputs.services }}
+      build_matrix: ${{ steps.build-matrix.outputs.matrix }}
+      has_extensions: ${{ steps.build-matrix.outputs.has_extensions }}
+
+    steps:
+      # Decode the GitHub App private key.
+      # Skips decode if -----BEGIN is detected, allowing raw or base64-encoded secrets.
+      # Raw secrets are auto-masked by GitHub; the decoded derivative is not, so mask it explicitly.
+      - name: Decode the GitHub App private key
+        id: decode
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          SECRET_VALUE: ${{ secrets.BALENAOS_CI_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SECRET_VALUE" ]]; then
+            echo "::warning::BALENAOS_CI_APP_PRIVATE_KEY not set - GitHub App auth disabled (abrp)"
+            echo "private-key=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$SECRET_VALUE" == *"-----BEGIN"* ]]; then
+            echo "Detected unencoded private key, skipping base64 decode"
+            private_key="$SECRET_VALUE"
+          else
+            if ! private_key=$(echo "$SECRET_VALUE" | base64 -d); then
+              echo "::error::Failed to base64 decode BALENAOS_CI_APP_PRIVATE_KEY. Verify the secret is valid base64."
+              exit 1
+            fi
+            while IFS= read -r line; do
+              [[ -n "$line" ]] && echo "::add-mask::$line"
+            done <<< "$private_key"
+          fi
+          if [[ "$private_key" != *"-----BEGIN"* ]]; then
+            echo "::error::Decoded private key does not look like a PEM key (missing -----BEGIN header). Check secret encoding."
+            exit 1
+          fi
+          delimiter="pk_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          {
+            echo "private-key<<${delimiter}"
+            echo "$private_key"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Generate an app installation token that has access to
+      # all repos where the app is installed (usually the whole org)
+      # Owner input to make token valid for all repositories in the org
+      # This behvaiour is required for private submodules
+      # https://github.com/actions/create-github-app-token
+      - name: Create GitHub App installation token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        if: ${{ vars.BALENAOS_CI_APP_ID != '' }}
+        with:
+          client-id: ${{ vars.BALENAOS_CI_APP_ID }}
+          private-key: ${{ steps.decode.outputs.private-key }}
+          owner: ${{ github.repository_owner }}
+
+      # Generate another app token for the balena-io organization
+      # so we can checkout private contracts
+      # https://github.com/actions/create-github-app-token
+      - name: Create GitHub App installation token (balena-io)
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token-balena-io
+        if: ${{ vars.BALENAOS_CI_APP_ID != '' }}
+        with:
+          client-id: ${{ vars.BALENAOS_CI_APP_ID }}
+          private-key: ${{ steps.decode.outputs.private-key }}
+          owner: balena-io
+
+      # https://github.com/actions/checkout
+      - name: Clone device repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ inputs.device-repo }}
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          ref: ${{ inputs.device-repo-ref }} # In the case of a new tagged version, this will be the new tag, claimed from ${{ github.events.push.ref }}
+          submodules: true
+          fetch-depth: 0 # DEBUG - this is for testing on a device repo
+          fetch-tags: true
+          # Do not persist the app installation token credentials,
+          # and prefer that each step provide credentials where required
+          persist-credentials: false
+
+      # Checkout the right ref for meta-balena submodule
+      - name: Update meta-balena submodule to ${{ inputs.meta-balena-ref }}
+        if: inputs.meta-balena-ref != ''
+        working-directory: ./layers/meta-balena
+        run: |
+          git config --add remote.origin.fetch '+refs/pull/*:refs/remotes/origin/pr/*'
+          git fetch --all
+          git checkout --force "${{ inputs.meta-balena-ref }}"
+          git submodule update --init --recursive
+
+      # Checkout the right ref for balena-yocto-scripts submodule
+      - name: Update balena-yocto-scripts submodule to ${{ inputs.yocto-scripts-ref }}
+        if: inputs.yocto-scripts-ref != ''
+        working-directory: ./balena-yocto-scripts
+        run: |
+          git config --add remote.origin.fetch '+refs/pull/*:refs/remotes/origin/pr/*'
+          git fetch --all
+          git checkout --force "${{ inputs.yocto-scripts-ref }}"
+          git submodule update --init --recursive
+
+      # Check if the repository is a yocto device respository
+      - name: Device repository check
+        run: |
+          if [ "$(yq '.type' repo.yml)" != "yocto-based OS image" ]; then
+            echo "::error::Repository does not appear to be of type 'yocto-based OS image'"
+            exit 1
+          fi
+
+      # A lot of outputs inferred from here are used everywhere else in the workflow
+      - name: Set build outputs
+        id: balena-lib
+        env:
+          CURL: "curl --silent --retry 10 --location --compressed"
+          TRANSLATION: "v6"
+          BALENAOS_TOKEN: ${{ secrets.BALENA_API_DEPLOY_KEY }}
+          API_ENV: ${{ env.BALENARC_BALENA_URL }}
+        run: |
+          source "${automation_dir}/include/balena-api.inc"
+          source "${automation_dir}/include/balena-lib.inc"
+
+          ./balena-yocto-scripts/build/build-device-type-json.sh
+
+          device_slug="$(balena_lib_get_slug "${SLUG}")"
+          echo "device_slug=${device_slug}" >>"${GITHUB_OUTPUT}"
+
+          # As we use this to determine the os version from the device repository - when checking out the repo we need enough fetch depth to get tags
+          os_version=$(git describe --abbrev=0)
+          echo "os_version=${os_version#v*}" >>"${GITHUB_OUTPUT}"
+
+          meta_balena_version="$(balena_lib_get_meta_balena_base_version)"
+          echo "meta_balena_version=${meta_balena_version}" >>"${GITHUB_OUTPUT}"
+
+          device_repo_revision="$(git rev-parse --short HEAD)"
+          echo "device_repo_revision=${device_repo_revision}" >>"${GITHUB_OUTPUT}"
+
+          yocto_scripts_ref="$(git submodule status balena-yocto-scripts | awk '{print $1}')"
+          echo "yocto_scripts_ref=${yocto_scripts_ref}" >>"${GITHUB_OUTPUT}"
+
+          yocto_scripts_version="$(cd balena-yocto-scripts && head -n1 VERSION)"
+          echo "yocto_scripts_version=${yocto_scripts_version}" >>"${GITHUB_OUTPUT}"
+
+          deploy_artifact="$(balena_lib_get_deploy_artifact "${SLUG}")"
+          echo "deploy_artifact=${deploy_artifact}" >>"${GITHUB_OUTPUT}"
+
+          dt_arch="$(balena_lib_get_dt_arch "${SLUG}")"
+          echo "dt_arch=${dt_arch}" >>"${GITHUB_OUTPUT}"
+
+      - name: Prepare hostapp composition
+        run: |
+          COMPOSITION="${MACHINE}.hostapp.yml"
+          META_COMPOSITION="layers/meta-balena/hostapp.yml"
+
+          if [ -f "${META_COMPOSITION}" ] && [ -f "${COMPOSITION}" ]; then
+            echo "[INFO] Merging meta-balena composition with device repo overlay"
+            yq eval-all 'select(fileIndex == 0) *d select(fileIndex == 1)' \
+              "${META_COMPOSITION}" "${COMPOSITION}" > "${COMPOSITION}.tmp"
+            mv "${COMPOSITION}.tmp" "${COMPOSITION}"
+          elif [ -f "${META_COMPOSITION}" ]; then
+            echo "[INFO] Using meta-balena composition (no device repo overlay)"
+            cp "${META_COMPOSITION}" "${COMPOSITION}"
+          elif [ ! -f "${COMPOSITION}" ]; then
+            echo "[INFO] No composition file found, generating default"
+            cat > "${COMPOSITION}" <<'COMPEOF'
+          # yaml-language-server: $schema=https://raw.githubusercontent.com/balena-os/balena-yocto-scripts/master/schemas/hostapp-composition.json
+          version: '2.4'
+          services:
+            hostapp:
+              image: __BUILD_OUTPUT__
+              x-build: {}
+              labels:
+                io.balena.image.store: 'root'
+                io.balena.image.class: 'hostapp'
+                io.balena.update.requires-reboot: '1'
+                io.balena.private.hostapp.board-rev: '__DEVICE_REPO_REV__'
+          COMPEOF
+          fi
+
+          # A device overlay opts out of a service entirely by nulling the whole key (e.g., `kernel-modules: ~`).
+          # yq's *d operator propagates the null through the merge; this step then deletes the null entries.
+          # For build-only opt-out (keep the service in deploy but drop it from the build matrix), a device overlay
+          # sets x-build: ~ alongside a concrete image: field — same null-override pattern, applied to a nested key.
+          yq -i '.services |= with_entries(select(.value != null))' "${COMPOSITION}"
+
+          echo "[INFO] Composition:"
+          cat "${COMPOSITION}"
+
+      - name: Validate composition
+        run: |
+          COMPOSITION="${MACHINE}.hostapp.yml"
+          SCHEMA="balena-yocto-scripts/schemas/hostapp-composition.json"
+
+          # Soft-skip if the submodule pointer predates the schema file. Once device repos bump their
+          # balena-yocto-scripts submodule to a ref that contains schemas/, validation activates automatically.
+          if [ ! -f "${SCHEMA}" ]; then
+            echo "::warning title=Schema not available::${SCHEMA} not found in the checkout — structural validation skipped. Update the balena-yocto-scripts submodule pointer to enable it."
+          else
+            # Structural validation: compose-spec compliance + x-build shape.
+            # Catches typos (x-buld), wrong types (recipe: 42), unknown fields inside x-build.
+            # Semantic rules (recipe uniqueness, build_slot/x-build pairing) live in the yq checks below.
+            pipx install check-jsonschema >/dev/null 2>&1 || pip install --user --quiet check-jsonschema
+            check-jsonschema --schemafile "${SCHEMA}" "${COMPOSITION}"
+          fi
+
+          # Reject empty/missing services upfront — downstream yq queries return [] silently otherwise.
+          n_services=$(yq '.services // {} | length' "${COMPOSITION}")
+          if [ "${n_services}" -eq 0 ]; then
+            echo "::error title=Invalid composition::Missing or empty 'services' in ${COMPOSITION}"
+            cat "${COMPOSITION}"
+            exit 1
+          fi
+
+          # Each service must have exactly one build provenance:
+          #   - image: __BUILD_OUTPUT__ paired with a truthy x-build (workflow builds it)
+          #   - concrete image with no x-build (deployed from a registry)
+          # Detect each mismatch separately so the error message points at the actual problem.
+          build_slot_no_build=$(yq -o=json '[.services | to_entries[] | select(
+            (.value.image // "") == "__BUILD_OUTPUT__" and
+            ((.value."x-build" // null) == null)
+          ) | .key]' "${COMPOSITION}")
+
+          build_no_slot=$(yq -o=json '[.services | to_entries[] | select(
+            ((.value."x-build" // null) != null) and
+            ((.value.image // "") != "__BUILD_OUTPUT__")
+          ) | .key]' "${COMPOSITION}")
+
+          if [ "$(echo "${build_slot_no_build}" | jq 'length')" -ne 0 ]; then
+            echo "::error title=Invalid composition::Services with image: __BUILD_OUTPUT__ require a truthy x-build block: ${build_slot_no_build}"
+            cat "${COMPOSITION}"
+            exit 1
+          fi
+
+          if [ "$(echo "${build_no_slot}" | jq 'length')" -ne 0 ]; then
+            echo "::error title=Invalid composition::Services with a truthy x-build must declare image: __BUILD_OUTPUT__: ${build_no_slot}"
+            cat "${COMPOSITION}"
+            exit 1
+          fi
+
+          # Extension archive matching uses ${recipe}-${MACHINE}.docker as the join key;
+          # duplicate recipes silently shadow each other at deploy time.
+          # Split filter from projection: yq's `map(select(cond) | proj)` keeps non-matching
+          # entries with a null-projected result (unlike jq). `map(select) | map(proj)` filters
+          # first, so length-1 groups drop out instead of becoming {services: []} false positives.
+          dup_recipes=$(yq -o=json '.services | to_entries | map(select(.value."x-build".recipe != null) | {"service": .key, "recipe": .value."x-build".recipe}) | group_by(.recipe) | map(select(length > 1)) | map({"recipe": .[0].recipe, "services": [.[] | .service]})' "${COMPOSITION}")
+          if [ "$(echo "${dup_recipes}" | jq 'length')" -ne 0 ]; then
+            echo "::error title=Duplicate x-build.recipe::Recipe values must be unique across services: ${dup_recipes}"
+            cat "${COMPOSITION}"
+            exit 1
+          fi
+
+      - name: Parse build matrix
+        id: build-matrix
+        run: |
+          COMPOSITION="${MACHINE}.hostapp.yml"
+          echo "Parsing composition: ${COMPOSITION}"
+
+          # Services opt in to the build pipeline by declaring a truthy x-build (including empty {}).
+          # Device-repo overlays can opt out of a meta-balena-defined extension by setting `x-build: ~`,
+          # which the deep merge propagates as null — falsy, so the service is excluded from the matrix.
+          matrix=$(yq -o=json '[.services | to_entries[] | select(.value."x-build") | {
+            "service_name": .key,
+            "recipe": (.value."x-build".recipe // ""),
+            "build_args": (.value."x-build".build_args // [] | join(" ")),
+            "assets": (.value."x-build".assets // [] | join("\n")),
+            "image_class": (.value.labels."io.balena.image.class" // "overlay")
+          }]' "${COMPOSITION}")
+
+          # An empty matrix silently skips all downstream build jobs with green checks; fail fast instead.
+          if [ -z "${matrix}" ] || [ "${matrix}" = "null" ] || [ "$(echo "${matrix}" | jq 'length')" -eq 0 ]; then
+            echo "::error title=Empty build matrix::No services with truthy x-build found in ${COMPOSITION}"
+            cat "${COMPOSITION}"
+            exit 1
+          fi
+
+          # A composition that builds only extensions but omits hostapp is almost certainly a mistake (device repo forgot to opt in).
+          if [ "$(echo "${matrix}" | jq 'any(.image_class == "hostapp")')" != "true" ]; then
+            echo "::error title=Missing hostapp service::No service with io.balena.image.class == hostapp in build matrix; a hostapp is required"
+            cat "${COMPOSITION}"
+            exit 1
+          fi
+
+          services=$(echo "${matrix}" | jq -c '[.[].service_name]')
+          # Matrix contains only services with truthy x-build (registry-pulled extensions are absent).
+          # >1 means at least one extension was built and will produce a .docker artifact to download.
+          # Computed here because GHA `if:` cannot evaluate fromJSON(...).length on a string output.
+          has_extensions=$([ "$(echo "${matrix}" | jq 'length')" -gt 1 ] && echo true || echo false)
+
+          echo "Build services: ${services}"
+          echo "Build matrix: ${matrix}"
+          echo "Has extensions: ${has_extensions}"
+          echo "services=${services}" >> "${GITHUB_OUTPUT}"
+          echo "has_extensions=${has_extensions}" >> "${GITHUB_OUTPUT}"
+          delimiter="$(openssl rand -hex 16)"
+          {
+            echo "matrix<<${delimiter}"
+            echo "${matrix}"
+            echo "${delimiter}"
+          } >> "${GITHUB_OUTPUT}"
+
+      # Unrolled balena_api_is_dt_private function - https://github.com/balena-os/balena-yocto-scripts/blob/master/automation/include/balena-api.inc#L424
+      # Had to be unrolled due to this: https://github.com/balena-os/balena-yocto-scripts/blob/master/automation/include/balena-lib.inc#L191 function relying on a jenkins env var to select the balena env - so failed
+      # is_private=$(${CURL} -XGET -H "Content-type: application/json" -H "Authorization: bearer ${BALENAOS_TOKEN}" --silent --retry 5 "https://api.${API_ENV}/${TRANSLATION}/device_type?\$filter=slug%20eq%20%27${device_slug}%27&\$select=slug,is_private" | jq -r '.d[0].is_private')
+      # echo "is_private=${is_private}" >>"${GITHUB_OUTPUT}"
+      - name: Check if device-type is private
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        id: is-private
+        env:
+          API_ENV: ${{ env.BALENARC_BALENA_URL }}
+          TRANSLATION: "v6"
+          DEVICE_SLUG: ${{ steps.balena-lib.outputs.device_slug }}
+        with:
+          result-encoding: json
+          script: |
+            // abrp: openBalena api has no is_private on device_type - hardcode public
+            return false
+
+      - name: Checkout private contracts
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        if: steps.is-private.outputs.result == 'true'
+        with:
+          repository: balena-io/private-contracts
+          token: ${{ steps.app-token-balena-io.outputs.token }}
+          path: ${{ github.workspace }}/private-contracts
+          persist-credentials: false
+
+      - name: Build OS contract
+        env:
+          CONTRACTS_BUILD_DIR:
+            "${{ github.workspace }}/balena-yocto-scripts/build/contracts"
+          NODE: node
+          DEVICE_TYPE_SLUG: ${{ steps.balena-lib.outputs.device_slug }}
+          CONTRACTS_OUTPUT_DIR: "${{ github.workspace }}/build/contracts"
+        run: |
+          if ! npm --prefix="${CONTRACTS_BUILD_DIR}" ci > /dev/null; then
+            >&2 echo "[balena_lib_build_contracts]: npm failed installing dependencies"
+            exit 1
+          fi
+          NODE_PATH="${CONTRACTS_BUILD_DIR}/node_modules" ${NODE} "${CONTRACTS_BUILD_DIR}/generate-oscontracts.js" > /dev/null
+          if [ -f "${CONTRACTS_OUTPUT_DIR}/${DEVICE_TYPE_SLUG}/balena-os/balena.yml" ]; then
+            echo "${CONTRACTS_OUTPUT_DIR}/${DEVICE_TYPE_SLUG}/balena-os/balena.yml"
+          else
+            >&2 echo "[balena_lib_build_contracts]: Failed to build OS contract for ${DEVICE_TYPE_SLUG}. Ensure a hw.deviceType contract is in the appropriate repo"
+            exit 1
+          fi
+          cp "${CONTRACTS_OUTPUT_DIR}/${DEVICE_TYPE_SLUG}/balena-os/balena.yml" "${{ github.workspace }}/balena.yml"
+
+      - name: Upload composition and contract artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.MACHINE }}-hostapp-composition  # abrp: machine-suffixed (multi-machine fanout)
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            ${{ env.MACHINE }}.hostapp.yml
+            ${{ github.workspace }}/balena.yml
+
+      # In the old workflow we had to fetch the merge commit, get the check runs from the PR, and check if a device type passed or failed
+      # reference: https://github.com/balena-os/github-workflows/blob/master/.github/workflows/build_and_deploy.yml#L89
+      # NOTE: This will not be necessary if we had a way to deploy artifacts and mark as final like with fleet releases
+
+      # We're also checking out the tag in this step, so the subsequent build is done from the tagged version of the device repo
+      - name: "Fetch merge commit"
+        id: set-merge-commit
+        if: ${{ github.event_name == 'push' }} # Only perform on push event - i.e a new version tag
+        run: |
+          set -euo pipefail
+          merge_commit=$(git log --first-parent --format='%H %s' | grep -m1 -E '#[0-9]+' | cut -d' ' -f1 || true)
+          if [ -z "${merge_commit}" ]; then
+            echo "::error title=No PR commit found::Could not find a commit referencing a PR in the first-parent history of $(git rev-parse HEAD)"
+            exit 1
+          fi
+          echo "Found merge commit ${merge_commit}: $(git log -1 --format='%s' "${merge_commit}")"
+          echo "merge_commit=${merge_commit}" >>"${GITHUB_OUTPUT}"
+
+      # This will control the deployment of the hostapp only - it will determine if it is marked as final or not
+      # The hostapp being finalised is what determines if the API will present this OS version to user
+      # If the test_matrix is empty - it means there are no tests for the DT - so don't check tests, and don't finalise, unless manually done with "force-finalize" input
+      - name: Check test results
+        # https://docs.github.com/en/actions/learn-github-actions/expressions#functions
+        # this expression checks that the test_matrix input has a test suites defined - if there is no test_matrix input provided in the device-repo workflow file, test results won't be checked, and
+        # the release can't be finlized
+        if: |
+          github.event_name == 'push' &&
+          inputs.test_matrix &&
+          (
+            join(fromJSON(inputs.test_matrix).test_suite) != '' ||
+            join(fromJSON(inputs.test_matrix).include.*.test_suite) != ''
+          ) &&
+          inputs.finalize-on-push-if-tests-passed
+        id: merge-test-result
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          COMMIT: ${{ steps.set-merge-commit.outputs.merge_commit }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const commit = process.env.COMMIT;
+
+            // Extract the workflow file name from the WORKFLOW_REF, e.g.
+            // balena-os/balena-yocto-scripts/.github/workflows/genericx86-64-ext.yml@refs/pull/789/merge
+            // gives genericx86-64-ext.yml
+            const workflowRefMatch = process.env.WORKFLOW_REF.match(/([^/]+\.yml)@/);
+            if (!workflowRefMatch) {
+              core.setFailed(`Could not extract workflow file name from WORKFLOW_REF: ${process.env.WORKFLOW_REF}`);
+              return;
+            }
+            const workflowName = workflowRefMatch[1];
+
+            // Get the PR number from the merge commit message
+            const commitData = await github.rest.repos.getCommit({
+              ...context.repo,
+              ref: commit
+            });
+
+            const prMatch = commitData.data.commit.message.match(/#(\d+)/);
+            if (!prMatch) {
+              core.setFailed(`Could not extract PR number from commit message: ${commitData.data.commit.message}`);
+              return;
+            }
+            const prNumber = parseInt(prMatch[1]);
+
+            // Get the head commit of the PR
+            const pr = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: prNumber
+            });
+            const headSha = pr.data.head.sha;
+
+            // Fetch workflow runs for this commit and workflow
+            const workflowRuns = await github.rest.actions.listWorkflowRuns({
+              ...context.repo,
+              workflow_id: workflowName,
+              head_sha: headSha,
+              per_page: 20
+            });
+
+            // Filter for completed runs and sort by creation time
+            const completedRuns = workflowRuns.data.workflow_runs
+              .map(run => ({
+                id: run.id,
+                name: run.name,
+                event: run.event,
+                status: run.status,
+                conclusion: run.conclusion,
+                created_at: run.created_at,
+                html_url: run.html_url
+              }))
+              .filter(run => run.status === 'completed')
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+            if (completedRuns.length < 1) {
+              core.warning(`Did not find any completed workflow runs for commit ${headSha}`);
+              core.setOutput('finalize', 'false');
+              return 'false';
+            }
+
+            console.log(`Found ${completedRuns.length} completed workflow runs for commit ${headSha}`);
+            console.log(JSON.stringify(completedRuns, null, 2));
+
+            const conclusions = completedRuns.map(run => run.conclusion);
+
+            // Check for at least one success and no failures
+            const hasSuccess = conclusions.some(c => c === 'success');
+            const hasFailure = conclusions.some(c => c === 'failure');
+
+            const passed = hasSuccess && !hasFailure;
+            console.log(`Set finalize output to: ${passed}`);
+            core.setOutput('finalize', passed.toString());
+            return passed.toString();
+
+  build:
+    name: Build
+    runs-on: ${{ fromJSON(inputs.build-runs-on) }}
+    needs:
+      - approved-commit
+      - balena-lib
+
+    # This environment supports the following variables:
+    # - SIGN_API_URL
+    # - SIGN_GRUB_KEY_ID
+    # - SIGN_HAB_PKI_ID
+    # - SIGN_RSA_KEY_ID
+    # This environment also supports the following secrets:
+    # - SIGN_API_KEY
+    # - SIGN_KMOD_KEY_APPEND
+    # - YOCTO_SSH_PRIVATE_KEY_B64: used to pull private yocto sources from within the same organization
+    # abrp: signing environment removed — empty-string environment: is a startup_failure
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service_name: ${{ fromJSON(needs.balena-lib.outputs.build_services) }}
+        include: ${{ fromJSON(needs.balena-lib.outputs.build_matrix) }}
+
+    # https://docs.github.com/en/actions/security-guides/automatic-token-authentication
+    # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#permissions
+    # https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect#adding-permissions-settings
+    permissions:
+      id-token: write # This is required for requesting the JWT #https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services#requesting-the-access-token
+      packages: read
+      contents: read
+
+    env:
+      automation_dir: "${{ github.workspace }}/balena-yocto-scripts/automation"
+      BARYS_ARGUMENTS_VAR: ${{ inputs.build-args || '' }}
+      # https://docs.yoctoproject.org/3.1.21/overview-manual/overview-manual-concepts.html#user-configuration
+      # Create an autobuilder configuration file that is loaded before local.conf
+      AUTO_CONF_FILE: "${{ github.workspace }}/build/conf/auto.conf"
+      BALENARC_BALENA_URL: ${{ needs.balena-lib.outputs.balena_host }}
+      DEPLOY_PATH: ${{ github.workspace }}/deploy
+      # S3_DEPLOY_PATH is the DEPLOY_PATH + the device slug and os version as is expected by the prepare.ts script from image maker
+      S3_DEPLOY_PATH: ${{ github.workspace }}/deploy/${{ needs.balena-lib.outputs.device_slug }}/${{ needs.balena-lib.outputs.os_version }}
+
+    defaults:
+      run:
+        working-directory: .
+        shell: bash --noprofile --norc -eo pipefail -x {0}
+
+    steps:
+      # this must be done before putting files in the workspace
+      # https://github.com/easimon/maximize-build-space
+      - name: Maximize build space
+        # abrp: any GH-hosted runner (larger runners carry custom labels)
+        if: "!contains(join(fromJSON(inputs.build-runs-on), ','), 'self-hosted')"
+        uses: easimon/maximize-build-space@c28619d8999a147d5e09c1199f84ff6af6ad5794
+        with:
+          root-reserve-mb: "4096"
+          temp-reserve-mb: "1024"
+          swap-size-mb: "4096"
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      # Decode the GitHub App private key.
+      # Skips decode if -----BEGIN is detected, allowing raw or base64-encoded secrets.
+      # Raw secrets are auto-masked by GitHub; the decoded derivative is not, so mask it explicitly.
+      - name: Decode the GitHub App private key
+        id: decode
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          SECRET_VALUE: ${{ secrets.BALENAOS_CI_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SECRET_VALUE" ]]; then
+            echo "::warning::BALENAOS_CI_APP_PRIVATE_KEY not set - GitHub App auth disabled (abrp)"
+            echo "private-key=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$SECRET_VALUE" == *"-----BEGIN"* ]]; then
+            echo "Detected unencoded private key, skipping base64 decode"
+            private_key="$SECRET_VALUE"
+          else
+            if ! private_key=$(echo "$SECRET_VALUE" | base64 -d); then
+              echo "::error::Failed to base64 decode BALENAOS_CI_APP_PRIVATE_KEY. Verify the secret is valid base64."
+              exit 1
+            fi
+            while IFS= read -r line; do
+              [[ -n "$line" ]] && echo "::add-mask::$line"
+            done <<< "$private_key"
+          fi
+          if [[ "$private_key" != *"-----BEGIN"* ]]; then
+            echo "::error::Decoded private key does not look like a PEM key (missing -----BEGIN header). Check secret encoding."
+            exit 1
+          fi
+          delimiter="pk_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          {
+            echo "private-key<<${delimiter}"
+            echo "$private_key"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Generate an app installation token that has access to
+      # all repos where the app is installed (usually the whole org)
+      # Owner input to make token valid for all repositories in the org
+      # This behvaiour is required for private submodules
+      # https://github.com/actions/create-github-app-token
+      - name: Create GitHub App installation token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        if: ${{ vars.BALENAOS_CI_APP_ID != '' }}
+        with:
+          client-id: ${{ vars.BALENAOS_CI_APP_ID }}
+          private-key: ${{ steps.decode.outputs.private-key }}
+          owner: ${{ github.repository_owner }}
+
+      # Generate another app token for the balena-io organization
+      # so we can checkout private contracts
+      # https://github.com/actions/create-github-app-token
+      - name: Create GitHub App installation token (balena-io)
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token-balena-io
+        if: ${{ vars.BALENAOS_CI_APP_ID != '' }}
+        with:
+          client-id: ${{ vars.BALENAOS_CI_APP_ID }}
+          private-key: ${{ steps.decode.outputs.private-key }}
+          owner: balena-io
+
+      # https://github.com/actions/checkout
+      - name: Clone device repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ inputs.device-repo }}
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          ref: ${{ inputs.device-repo-ref }} # In the case of a new tagged version, this will be the new tag, claimed from ${{ github.events.push.ref }}
+          submodules: true
+          fetch-depth: 0 # DEBUG - this is for testing on a device repo
+          fetch-tags: true
+          # Do not persist the app installation token credentials,
+          # and prefer that each step provide credentials where required
+          persist-credentials: false
+
+      # Checkout the right ref for meta-balena submodule
+      - name: Update meta-balena submodule to ${{ inputs.meta-balena-ref }}
+        if: inputs.meta-balena-ref != ''
+        working-directory: ./layers/meta-balena
+        run: |
+          git config --add remote.origin.fetch '+refs/pull/*:refs/remotes/origin/pr/*'
+          git fetch --all
+          git checkout --force "${{ inputs.meta-balena-ref }}"
+          git submodule update --init --recursive
+
+      # Checkout the right ref for balena-yocto-scripts submodule
+      - name: Update balena-yocto-scripts submodule to ${{ inputs.yocto-scripts-ref }}
+        if: inputs.yocto-scripts-ref != ''
+        working-directory: ./balena-yocto-scripts
+        run: |
+          git config --add remote.origin.fetch '+refs/pull/*:refs/remotes/origin/pr/*'
+          git fetch --all
+          git checkout --force "${{ inputs.yocto-scripts-ref }}"
+          git submodule update --init --recursive
+
+      # Causes tarballs of the source control repositories (e.g. Git repositories), including metadata, to be placed in the DL_DIR directory.
+      # https://docs.yoctoproject.org/4.0.5/ref-manual/variables.html?highlight=compress#term-BB_GENERATE_MIRROR_TARBALLS
+      # The github-script action is a safer method of writing to outputs and variables, vs a shell step.
+      # https://github.com/actions/github-script
+      - name: Enable mirror tarballs
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const currentValue = process.env.BARYS_ARGUMENTS_VAR || '';
+            const newValue = `${currentValue} -a BB_GENERATE_MIRROR_TARBALLS=1`;
+            core.exportVariable('BARYS_ARGUMENTS_VAR', newValue);
+
+      - name: Enable signed images
+        if: inputs.sign-image == true && matrix.image_class == 'hostapp'
+        env:
+          SIGN_API: "${{ vars.SIGN_API_URL || 'https://sign.balena-cloud.com' }}"
+          SIGN_API_KEY: "${{ secrets.SIGN_API_KEY }}"
+          SIGN_GRUB_KEY_ID: "${{ vars.SIGN_GRUB_KEY_ID || '2EB29B4CE0132F6337897F5FB8A88D1C62FCC729' }}"
+          SIGN_KMOD_KEY_APPEND: "${{ secrets.SIGN_KMOD_KEY_APPEND }}"
+          SIGN_HAB_PKI_ID: "${{ vars.SIGN_HAB_PKI_ID || 'b4ce3cb4cfd70a27b4e641f81a9048af' }}"
+          SIGN_RSA_KEY_ID: "${{ vars.SIGN_RSA_KEY_ID || 'fe1b0af3afa08cc40df6000402404220' }}"
+        run: |
+          BARYS_ARGUMENTS_VAR="${BARYS_ARGUMENTS_VAR} -a SIGN_API=${SIGN_API}"
+          BARYS_ARGUMENTS_VAR="${BARYS_ARGUMENTS_VAR} -a SIGN_API_KEY=${SIGN_API_KEY}"
+          BARYS_ARGUMENTS_VAR="${BARYS_ARGUMENTS_VAR} -a SIGN_GRUB_KEY_ID=${SIGN_GRUB_KEY_ID}"
+          BARYS_ARGUMENTS_VAR="${BARYS_ARGUMENTS_VAR} -a SIGN_KMOD_KEY_APPEND=${SIGN_KMOD_KEY_APPEND}"
+          BARYS_ARGUMENTS_VAR="${BARYS_ARGUMENTS_VAR} -a SIGN_HAB_PKI_ID=${SIGN_HAB_PKI_ID}"
+          BARYS_ARGUMENTS_VAR="${BARYS_ARGUMENTS_VAR} -a SIGN_RSA_KEY_ID=${SIGN_RSA_KEY_ID}"
+          echo "BARYS_ARGUMENTS_VAR=${BARYS_ARGUMENTS_VAR}" >>"${GITHUB_ENV}"
+
+      # https://docs.yoctoproject.org/4.0.10/ref-manual/classes.html?highlight=source_mirror#own-mirrors-bbclass
+      # https://github.com/openembedded/openembedded/blob/master/classes/own-mirrors.bbclass
+      # The own-mirrors class makes it easier to set up your own PREMIRRORS from which to first fetch source before
+      # attempting to fetch it from the upstream specified in SRC_URI within each recipe.
+      - name: Install openssh-client package
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client
+
+      # Self-CI: wait for Flowzone's bake/publish to push the per-PR helper
+      # image before the Build step tries to pull it. Flowzone runs in parallel
+      # so without this we race the bake job and the pull fails.
+      - name: Wait for helper image
+        if: github.repository == 'balena-os/balena-yocto-scripts' && github.event_name == 'pull_request'
+        uses: lewagon/wait-on-check-action@9312864dfbc9fd208e9c0417843430751c042800 # v1.7.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          check-regexp: "Flowzone / Publish docker .*"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 30
+          allowed-conclusions: success
+          checks-discovery-timeout: 300
+
+      # All preperation complete before this step
+      # Start building balenaOS
+      - name: Allow BitBake user namespaces (Ubuntu 24.04 AppArmor)
+        # abrp: GH-hosted ubuntu runners ship
+        # kernel.apparmor_restrict_unprivileged_userns=1 - BitBake/pseudo
+        # cannot create user namespaces ("User namespaces are not usable by
+        # BitBake, possibly due to AppArmor"). Same sysctl fix as our
+        # self-hosted runner (persisted there via /etc/sysctl.d), per-run here.
+        if: "!contains(join(fromJSON(inputs.build-runs-on), ','), 'self-hosted')"
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Restore sstate cache (cross-run artifact)
+        # abrp: no persistent runner dir on GitHub-hosted runners — keep the
+        # per-machine sstate dir as a workflow artifact (free for public repos)
+        # and restore the latest non-expired one before building. Cold build on
+        # the first run / after retention expiry is expected and fine.
+        # (quoted: a bare leading ! parses as a YAML tag)
+        if: "!contains(join(fromJSON(inputs.build-runs-on), ','), 'self-hosted')"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHARED_BUILD_DIR: ${{ github.workspace }}/shared
+        run: |
+          set -euo pipefail
+          art_id=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${MACHINE}-sstate&per_page=1" --jq '.artifacts[0] | select(.expired == false) | .id')
+          if [ -z "${art_id}" ]; then
+            echo "no ${MACHINE}-sstate artifact available — cold build"
+            exit 0
+          fi
+          echo "restoring sstate artifact id=${art_id}"
+          mkdir -p "${SHARED_BUILD_DIR}/${MACHINE}"
+          curl --silent --show-error --location \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${art_id}/zip" \
+            -o /tmp/sstate.zip
+          # abrp: stream zip->tar->extract so peak disk stays at zip + extracted
+          # (a first attempt kept zip + inner tar + extracted ~= 15G on the
+          # ~20G root disk and killed the runner agent mid-restore).
+          unzip -p /tmp/sstate.zip sstate.tar | tar -xf - -C "${SHARED_BUILD_DIR}/${MACHINE}"
+          rm -f /tmp/sstate.zip
+          du -sh "${SHARED_BUILD_DIR}/${MACHINE}/sstate" || true
+
+      - name: Build
+        id: build
+        env:
+          HELPER_IMAGE_REPO: ghcr.io/balena-os/balena-yocto-scripts
+          # Self-CI: use the per-PR helper image baked by Flowzone instead of
+          # the master-tip image. Empty falls through to the VERSION-file
+          # default for downstream device repos that consume this workflow.
+          BALENA_YOCTO_SCRIPTS_VERSION: ${{ github.repository == 'balena-os/balena-yocto-scripts' && github.event_name == 'pull_request' && format('build-{0}', github.event.pull_request.head.sha) || '' }}
+          SHARED_BUILD_DIR: ${{ contains(join(fromJSON(inputs.build-runs-on), ','), 'self-hosted') && '/srv/yocto/shared' || format('{0}/shared', github.workspace) }}  # abrp: /srv on self-hosted, workspace (artifact-sstate) otherwise
+          YOCTO_SSH_PRIVATE_KEY_B64: ${{ secrets.YOCTO_SSH_PRIVATE_KEY_B64 }}
+          # Use the target deploy environment (balena-cloud.com, balena-staging.com, balena-dev.com...) to
+          # preload the supervisor from the correct registry
+          DEPLOY_ENV: ${{ needs.balena-lib.outputs.balena_host }}
+          # Matrix values are read from a repo-authored composition; route through env to prevent shell injection.
+          MATRIX_RECIPE: ${{ matrix.recipe }}
+          MATRIX_IMAGE_CLASS: ${{ matrix.image_class }}
+          MATRIX_BUILD_ARGS: ${{ matrix.build_args }}
+        run: |
+          # When building for non-x86 device types, meson, after building binaries must try to run them via qemu if possible , maybe as some sanity check or test?
+          # Therefore qemu must be used - and our runner mmap_min_addr is set to 4096 (default, set here: https://github.com/product-os/github-runner-kernel/blob/ef5a66951599dc64bf2920d896c36c6d9eda8df6/config/5.10/microvm-kernel-x86_64-5.10.config#L858
+          # Using a value of 4096 leads to issues https://gitlab.com/qemu-project/qemu/-/issues/447 so we must set it to 65536
+          # We do this in the workflow instead of the runner kernel as it makes this portable across runners
+          sysctl vm.mmap_min_addr
+          sudo sysctl -w vm.mmap_min_addr=65536
+          sysctl vm.mmap_min_addr
+
+          mkdir -p "${SHARED_BUILD_DIR}"
+
+          # abrp: upstream created auto.conf in the (removed) S3 MIRRORS step;
+          # create it empty here so the read below works
+          mkdir -p "$(dirname "${AUTO_CONF_FILE}")"
+          touch "${AUTO_CONF_FILE}"
+          cat "${AUTO_CONF_FILE}"
+
+          >&2 eval "$(ssh-agent)"
+          # abrp: SSH key optional (no private submodules)
+          if [ -n "${YOCTO_SSH_PRIVATE_KEY_B64}" ]; then
+            echo "${YOCTO_SSH_PRIVATE_KEY_B64}" | base64 -d | ssh-add - >&2
+          fi
+
+          # Common args needed by all matrix legs
+          COMMON_ARGS="-a BB_GENERATE_MIRROR_TARBALLS=1 -a DEVICE_TYPE=${SLUG}"
+
+          # Recipe flag: extensions pass -i <recipe>, hostapp omits it (uses deploy_artifact default)
+          BITBAKE_TARGET_ARG=""
+          if [ -n "${MATRIX_RECIPE}" ]; then
+            BITBAKE_TARGET_ARG="-i ${MATRIX_RECIPE}"
+          fi
+
+          # Hostapp additionally receives the caller's build-args input (used e.g. for a sample conf); extensions rely on x-build.build_args alone.
+          BARYS_ARGS="${COMMON_ARGS} ${MATRIX_BUILD_ARGS}"
+          if [ "${MATRIX_IMAGE_CLASS}" = "hostapp" ]; then
+            BARYS_ARGS="${BARYS_ARGS} ${BARYS_ARGUMENTS_VAR}"
+          fi
+
+          ./balena-yocto-scripts/build/balena-build.sh \
+            -d "${MACHINE}" \
+            -a "${DEPLOY_ENV}" \
+            -s "${SHARED_BUILD_DIR}" \
+            ${BITBAKE_TARGET_ARG} \
+            -g "${BARYS_ARGS}" | tee balena-build.log
+
+          if ! grep -q "Build for ${{ inputs.machine }} suceeded" balena-build.log; then
+            exit 1
+          fi
+
+      - name: Save sstate cache (cross-run artifact)
+        # abrp: only the hostapp matrix leg saves — all legs share one artifact
+        # name, parallel extension legs would race ("artifact name conflict").
+        if: "!contains(join(fromJSON(inputs.build-runs-on), ','), 'self-hosted') && matrix.image_class == 'hostapp'"
+        env:
+          SHARED_BUILD_DIR: ${{ github.workspace }}/shared
+        run: |
+          set -euo pipefail
+          tar -cf /tmp/sstate.tar -C "${SHARED_BUILD_DIR}/${MACHINE}" sstate
+
+      - name: Upload sstate cache artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: "!contains(join(fromJSON(inputs.build-runs-on), ','), 'self-hosted') && matrix.image_class == 'hostapp'"
+        with:
+          name: ${{ env.MACHINE }}-sstate
+          path: /tmp/sstate.tar
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Verify kernel module signing key
+        if:
+          inputs.sign-image == true && inputs.extra_signing_key == true &&
+          matrix.image_class == 'hostapp'
+        env:
+          automation_dir: "${{ github.workspace }}/balena-yocto-scripts/automation"
+          HELPER_IMAGE_REPO: ghcr.io/balena-os/balena-yocto-scripts
+          # Self-CI: use the per-PR helper image baked by Flowzone instead of
+          # the master-tip image. Empty falls through to the VERSION-file
+          # default for downstream device repos that consume this workflow.
+          BALENA_YOCTO_SCRIPTS_VERSION: ${{ github.repository == 'balena-os/balena-yocto-scripts' && github.event_name == 'pull_request' && format('build-{0}', github.event.pull_request.head.sha) || '' }}
+          SHARED_BUILD_DIR: ${{ contains(join(fromJSON(inputs.build-runs-on), ','), 'self-hosted') && '/srv/yocto/shared' || format('{0}/shared', github.workspace) }}  # abrp: /srv on self-hosted, workspace (artifact-sstate) otherwise
+          SIGN_KMOD_KEY_APPEND: "${{ secrets.SIGN_KMOD_KEY_APPEND }}"
+          INSTALL_DIR: /work
+          BUILD_DIR: build
+        run: |
+          if [ -z "${SIGN_KMOD_KEY_APPEND}" ]; then
+            echo "SIGN_KMOD_KEY_APPEND is expected but not set, verify that SIGN_KMOD_KEY_APPEND secret was set"
+            exit 1
+          fi
+
+          # This step verifies that the extra kernel module signing key is actually embedded in the kernel image.
+
+          # First it re-enters the Yocto helper container, as the "builder" user, and runs `bitbake -e virtual/kernel`
+          # to extract the kernel build (`B`) and source (`S`) directories from the real bitbake environment.
+          # It then maps those paths back to the runner and checks that the extra signing key
+          # provided via SIGN_KMOD_KEY_APPEND is actually embedded in at least one built `vmlinux`.
+
+          mkdir -p "${SHARED_BUILD_DIR}"
+
+          # Source balena-lib to get helper functions
+          source "${automation_dir}/include/balena-lib.inc"
+
+          # Pull the helper image
+          if ! balena_lib_docker_pull_helper_image "${HELPER_IMAGE_REPO}" "" "yocto-build-env" helper_image_id; then
+            echo "Failed to pull helper image"
+            exit 1
+          fi
+
+          # Create script to create the "builder" user
+          CREATE_BUILDER_USER_SCRIPT="/tmp/create-builder-user.sh"
+          cat > "${CREATE_BUILDER_USER_SCRIPT}" <<- 'CREATE_USER_EOF'
+          	#!/bin/bash
+          	set -e
+          	groupadd -g $BUILDER_GID builder 2>/dev/null || true
+          	if ! cat /etc/group | grep docker > /dev/null; then
+          	  groupadd docker
+          	fi
+          	useradd -m -u $BUILDER_UID -g $BUILDER_GID -G docker builder 2>/dev/null || true
+          CREATE_USER_EOF
+          chmod +x "${CREATE_BUILDER_USER_SCRIPT}"
+
+          # Create script to extract bitbake environment
+          GET_BITBAKE_ENV_SCRIPT="/tmp/get-bitbake-env.sh"
+          cat > "${GET_BITBAKE_ENV_SCRIPT}" <<- 'GET_ENV_EOF'
+          	#!/bin/bash
+          	set -e
+          	if [ ! -f "${INSTALL_DIR}/layers/poky/oe-init-build-env" ]; then
+          	  echo "Error: Yocto environment not found" >&2
+          	  exit 1
+          	fi
+          	source "${INSTALL_DIR}/layers/poky/oe-init-build-env" "${INSTALL_DIR}/${BUILD_DIR}" > /dev/null 2>&1
+          	BITBAKE_ENV=$(MACHINE=${MACHINE} bitbake -e virtual/kernel 2>&1)
+          	BITBAKE_EXIT=$?
+          	if [ $BITBAKE_EXIT -eq 0 ] && [ -n "$BITBAKE_ENV" ]; then
+          	  echo "$BITBAKE_ENV" | grep -E '^(B=|S=)'
+          	  exit 0
+          	else
+          	  echo "Error: bitbake command failed or returned empty output" >&2
+          	  exit 1
+          	fi
+          GET_ENV_EOF
+          chmod +x "${GET_BITBAKE_ENV_SCRIPT}"
+
+          DL_DIR="${SHARED_BUILD_DIR}/shared-downloads"
+          SSTATE_DIR="${SHARED_BUILD_DIR}/${MACHINE}/sstate"
+
+          # Re-enter the Yocto container with the same mounts as the build to run bitbake commands
+          # Output is captured to extract kernel build/source directory paths
+          BITBAKE_ENV_OUTPUT=$(docker run --rm \
+            -v "${{ github.workspace }}":/work \
+            -v "${DL_DIR}":/yocto/shared-downloads \
+            -v "${SSTATE_DIR}":/yocto/shared-sstate \
+            -v "${CREATE_BUILDER_USER_SCRIPT}":/create-builder-user.sh:ro \
+            -v "${GET_BITBAKE_ENV_SCRIPT}":/get-bitbake-env.sh:ro \
+            -e BUILDER_UID="$(id -u)" \
+            -e BUILDER_GID="$(id -g)" \
+            -e INSTALL_DIR="${INSTALL_DIR}" \
+            -e BUILD_DIR="${BUILD_DIR}" \
+            -e MACHINE="${MACHINE}" \
+            --privileged \
+            "${helper_image_id}" \
+            /bin/bash -c "/create-builder-user.sh >/dev/null && su builder -c /get-bitbake-env.sh" 2>&1)
+          DOCKER_EXIT_CODE=$?
+
+          if [ $DOCKER_EXIT_CODE -ne 0 ]; then
+            echo "Error: Container failed to run (exit code: $DOCKER_EXIT_CODE)" >&2
+            echo "Output:" >&2
+            echo "$BITBAKE_ENV_OUTPUT" >&2
+            rm -f "${CREATE_BUILDER_USER_SCRIPT}" "${GET_BITBAKE_ENV_SCRIPT}"
+            exit 1
+          fi
+
+          rm -f "${CREATE_BUILDER_USER_SCRIPT}" "${GET_BITBAKE_ENV_SCRIPT}"
+
+          # Extract the kernel build and source directories from the bitbake environment
+          KERNEL_BUILD_DIR_CONTAINER=$(echo "$BITBAKE_ENV_OUTPUT" | awk -F'"' '/^B="/{print $2}')
+          KERNEL_SRC_DIR_CONTAINER=$(echo "$BITBAKE_ENV_OUTPUT" | awk -F'"' '/^S="/{print $2}')
+
+          if [ -z "$KERNEL_BUILD_DIR_CONTAINER" ] || [ -z "$KERNEL_SRC_DIR_CONTAINER" ]; then
+            echo "Error: Failed to extract KERNEL_BUILD_DIR or KERNEL_SRC_DIR from bitbake output" >&2
+            echo "Output:" >&2
+            echo "$BITBAKE_ENV_OUTPUT" >&2
+            exit 1
+          fi
+
+          # Convert container paths to runner paths
+          KERNEL_BUILD_DIR="${KERNEL_BUILD_DIR_CONTAINER#/work}"
+          KERNEL_BUILD_DIR="${{ github.workspace }}${KERNEL_BUILD_DIR}"
+          KERNEL_SRC_DIR="${KERNEL_SRC_DIR_CONTAINER#/work}"
+          KERNEL_SRC_DIR="${{ github.workspace }}${KERNEL_SRC_DIR}"
+
+          # Verify converted paths exist on runner
+          if [ ! -d "$KERNEL_BUILD_DIR" ]; then
+            echo "Error: KERNEL_BUILD_DIR does not exist: $KERNEL_BUILD_DIR" >&2
+            exit 1
+          fi
+          if [ ! -d "$KERNEL_SRC_DIR" ]; then
+            echo "Error: KERNEL_SRC_DIR does not exist: $KERNEL_SRC_DIR" >&2
+            exit 1
+          fi
+
+          # Temporary files for the certificate extraction
+          EXTRACTED_CERT="/tmp/certs.der"
+          ORIGINAL_CERT_DER="/tmp/original_cert.der"
+          ORIGINAL_CERT_PEM="/tmp/original_cert.pem"
+
+          if ! touch "$EXTRACTED_CERT" 2>/dev/null; then
+            echo "Error: Cannot write to $EXTRACTED_CERT" >&2
+            exit 1
+          fi
+
+          # Reconstruct PEM format from base64 input
+          echo "-----BEGIN CERTIFICATE-----" > "$ORIGINAL_CERT_PEM"
+          echo "${SIGN_KMOD_KEY_APPEND}" >> "$ORIGINAL_CERT_PEM"
+          echo "-----END CERTIFICATE-----" >> "$ORIGINAL_CERT_PEM"
+
+          # Convert original PEM cert to DER for binary comparison
+          if ! openssl x509 -in "$ORIGINAL_CERT_PEM" -outform DER -out "$ORIGINAL_CERT_DER" 2>/dev/null; then
+            echo "Error: Could not convert original certificate to DER format" >&2
+            rm -f "$ORIGINAL_CERT_PEM" "$ORIGINAL_CERT_DER"
+            exit 2
+          fi
+
+          # Find all vmlinux files
+          mapfile -t VMLINUX_FILES < <(find "$KERNEL_BUILD_DIR" -type f -name "vmlinux" 2>/dev/null)
+          if [[ ${#VMLINUX_FILES[@]} -eq 0 ]]; then
+            echo "Error: No vmlinux files found under $KERNEL_BUILD_DIR" >&2
+            rm -f "$EXTRACTED_CERT" "$ORIGINAL_CERT_PEM" "$ORIGINAL_CERT_DER"
+            exit 3
+          fi
+
+          # For every vmlinux file, verify that at least one of them contains the original certificate
+          # there's generally two vmlinux file in the build directory, one of them has the kernel module signing key embedded
+          found_match=false
+          for vmlinux in "${VMLINUX_FILES[@]}"; do
+            echo "Testing vmlinux at: $vmlinux"
+
+            if ! "$KERNEL_SRC_DIR/scripts/extract-sys-certs.pl" "$vmlinux" "$EXTRACTED_CERT" 2>/dev/null; then
+              echo "Skipping: could not extract certs from $vmlinux"
+              continue
+            fi
+
+            # Check if the DER cert is present in the extracted binary blob
+            if grep -qFf "$ORIGINAL_CERT_DER" "$EXTRACTED_CERT" 2>/dev/null; then
+              echo "Match found in: $vmlinux"
+              found_match=true
+              break
+            else
+              echo "No match for $vmlinux"
+            fi
+          done
+
+          if [[ "$found_match" = false ]]; then
+            echo "No matching certificate found in any vmlinux under $KERNEL_BUILD_DIR" >&2
+            rm -f "$EXTRACTED_CERT" "$ORIGINAL_CERT_PEM" "$ORIGINAL_CERT_DER"
+            exit 4
+          fi
+
+          echo "Certificate verification successful"
+          rm -f "$EXTRACTED_CERT" "$ORIGINAL_CERT_PEM" "$ORIGINAL_CERT_DER"
+          exit 0
+
+      # We don't need to encrypt these as they are not sensitive if the repo is public anyway.
+      # https://github.com/actions/upload-artifact
+      - name: Upload build logs
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        # always upload build logs, even if the build fails
+        if: cancelled() == false
+        with:
+          name: build-logs-${{ env.MACHINE }}-${{ matrix.service_name }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 7
+          path: |
+            balena-build.log
+            build/tmp/log/**/*.log
+            build/tmp/work/*/*/*/temp/run.*
+            build/tmp/work/*/*/*/temp/log.*
+
+      # If there was a cache miss for this key, save a new cache.
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        if: ${{ vars.DOCKERHUB_USER != '' }}
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # TODO: Unroll balena_deploy_artifacts into the workflow shell directly
+      # and only package up what is needed for s3 deploy, hostapp deploy, and leviathan tests.
+      # https://github.com/balena-os/balena-yocto-scripts/blob/fe5debadae75e2b9cda9bd40aa2d0aced777860a/automation/include/balena-deploy.inc#L23
+      - name: Prepare hostapp artifacts
+        if: matrix.image_class == 'hostapp'
+        env:
+          ARTIFACTS_TAR: "${{ runner.temp }}/artifacts.tar.zst"
+        run: |
+          if ! command -v zip; then
+            sudo apt-get update
+            sudo apt-get install -y zip
+          fi
+
+          source "${automation_dir}/include/balena-deploy.inc"
+          balena_deploy_artifacts "${SLUG}" "${S3_DEPLOY_PATH}" false
+
+          find "${DEPLOY_PATH}" -exec ls -lh {} \;
+
+      # Deflate files are the main image artifact for S3 / webresource deploy
+      # is they are used by the img-maker and os download endpoints.
+      - name: Prepare deflate files
+        # abrp: balena/balena-img is a PRIVATE Docker Hub image (upstream CI uses
+        # DOCKERHUB_* secrets); deflate files only feed the balenaCloud img-maker
+        # (os download) which we do not use — hostapp deploy needs balena-image.docker only
+        if: matrix.image_class == 'hostapp' && false
+        run: |
+          docker run --rm \
+            -e BASE_DIR=/host/images \
+            -v "${DEPLOY_PATH}:/host/images" \
+            "${HELPER_IMAGE}" /usr/src/app/node_modules/.bin/ts-node /usr/src/app/scripts/prepare.ts
+
+          find "${DEPLOY_PATH}" -exec ls -lh {} \;
+
+      # Encryption is required for private device types, and signed images.
+      # We do this to obfuscate private device images on public repos,
+      # and to prevent running signed images that have not gone through review and may have security flaws.
+      # Additional file extensions can be added below, but are only required if included as artifact uploads.
+      - name: Encrypt signed/private artifacts
+        if:
+          (inputs.sign-image || needs.balena-lib.outputs.is_private == 'true')
+          && matrix.image_class == 'hostapp'
+        env:
+          PBDKF2_PASSPHRASE: ${{ secrets.PBDKF2_PASSPHRASE }}
+          PATHS_TO_ENCRYPT: |
+            ${{ env.S3_DEPLOY_PATH }}/balena-image.docker
+            ${{ env.S3_DEPLOY_PATH }}/image/*.img.zip
+            ${{ env.S3_DEPLOY_PATH }}/compressed*/*.deflate
+            ${{ env.S3_DEPLOY_PATH }}/*.manifest
+            ${{ env.S3_DEPLOY_PATH }}/kernel_modules_headers.tar.gz
+            ${{ env.S3_DEPLOY_PATH }}/secure-boot-lock.tar.gz
+        run: |
+          set -x
+          for file in $(echo "${PATHS_TO_ENCRYPT}" | tr '\n' ' '); do
+            if ! [ -f "${file}" ]; then
+              echo "File ${file} does not exist, skipping encryption."
+              continue
+            fi
+            openssl enc -v -e -aes-256-cbc -k "${PBDKF2_PASSPHRASE}" -pbkdf2 -iter 310000 -md sha256 -salt -in "${file}" -out "${file}.enc"
+            rm "${file}"
+          done
+
+      # Upload artifacts to be deployed to S3 / webresources along with the hostapp release.
+      # Primarily deflate files, and licenses, and manifests.
+      # https://github.com/actions/upload-artifact
+      - name: Upload hostapp artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: matrix.image_class == 'hostapp'
+        with:
+          name: ${{ env.MACHINE }}-hostapp-artifacts  # abrp
+          if-no-files-found: error
+          retention-days: 3
+          # Use 0 compression to avoid corrupting the encrypted files
+          compression-level: 0
+          # Look for both the encrypted (.enc) and unencrypted file variants.
+          # Do not upload uncompressed .img files as they can be restored from the compressed .zip files after download.
+          path: |
+            ${{ env.S3_DEPLOY_PATH }}/balena-image.docker
+            ${{ env.S3_DEPLOY_PATH }}/balena-image.docker.enc
+            ${{ env.S3_DEPLOY_PATH }}/compressed*/*.deflate
+            ${{ env.S3_DEPLOY_PATH }}/compressed*/*.deflate.enc
+            ${{ env.S3_DEPLOY_PATH }}/*.json
+            ${{ env.S3_DEPLOY_PATH }}/*.md
+            ${{ env.S3_DEPLOY_PATH }}/VERSION*
+            ${{ env.S3_DEPLOY_PATH }}/*.manifest
+            ${{ env.S3_DEPLOY_PATH }}/*.manifest.enc
+            ${{ env.S3_DEPLOY_PATH }}/licenses.tar.gz
+            ${{ env.S3_DEPLOY_PATH }}/cyclonedx/*/*.json
+            ${{ env.S3_DEPLOY_PATH }}/kernel_modules_headers.tar.gz
+            ${{ env.S3_DEPLOY_PATH }}/kernel_modules_headers.tar.gz.enc
+            ${{ env.S3_DEPLOY_PATH }}/secure-boot-lock.tar.gz.enc
+
+      # Used by Leviathan to test kernel module loading.
+      # https://github.com/actions/upload-artifact
+      - name: Upload kernel-module-headers artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: matrix.image_class == 'hostapp'
+        with:
+          name: ${{ env.MACHINE }}-kernel-module-headers  # abrp
+          if-no-files-found: error
+          retention-days: 3
+          # Use 0 compression to avoid corrupting the encrypted files
+          compression-level: 0
+          # Look for both the encrypted (.enc) and unencrypted file variants.
+          path: |
+            ${{ env.S3_DEPLOY_PATH }}/kernel_modules_headers.tar.gz
+            ${{ env.S3_DEPLOY_PATH }}/kernel_modules_headers.tar.gz.enc
+
+      # Used by Leviathan to test HUP.
+      # https://github.com/actions/upload-artifact
+      - name: Upload balena-image.docker artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: matrix.image_class == 'hostapp'
+        with:
+          name: ${{ env.MACHINE }}-balena-image.docker  # abrp
+          if-no-files-found: error
+          retention-days: 3
+          # Use 0 compression to avoid corrupting the encrypted files
+          compression-level: 0
+          # Look for both the encrypted (.enc) and unencrypted file variants.
+          path: |
+            ${{ env.S3_DEPLOY_PATH }}/balena-image.docker
+            ${{ env.S3_DEPLOY_PATH }}/balena-image.docker.enc
+
+      # May be used by Leviathan to run OS and cloud suites depending on the value of test_image in the test matrix.
+      # Used for AMI creation.
+      # https://github.com/actions/upload-artifact
+      - name: Upload balena.img.zip artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: matrix.image_class == 'hostapp'
+        with:
+          name: ${{ env.MACHINE }}-balena.img.zip  # abrp
+          if-no-files-found: error
+          retention-days: 3
+          # Use 0 compression to avoid corrupting the encrypted files
+          compression-level: 0
+          # Look for both the encrypted (.enc) and unencrypted file variants.
+          path: |
+            ${{ env.S3_DEPLOY_PATH }}/image/balena.img.zip
+            ${{ env.S3_DEPLOY_PATH }}/image/balena.img.zip.enc
+
+      # May be used by Leviathan to run OS and cloud suites depending on the value of test_image in the test matrix.
+      # https://github.com/actions/upload-artifact
+      - name: Upload balena-flasher.img.zip artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: matrix.image_class == 'hostapp'
+        with:
+          name: balena-flasher.img.zip
+          if-no-files-found: ignore
+          retention-days: 3
+          # Use 0 compression to avoid corrupting the encrypted files
+          compression-level: 0
+          # Look for both the encrypted (.enc) and unencrypted file variants.
+          path: |
+            ${{ env.S3_DEPLOY_PATH }}/image/balena-flasher.img.zip
+            ${{ env.S3_DEPLOY_PATH }}/image/balena-flasher.img.zip.enc
+
+      # May be used by Leviathan to run OS and cloud suites depending on the value of test_image in the test matrix.
+      # https://github.com/actions/upload-artifact
+      - name: Upload balena-raw.img.zip artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: matrix.image_class == 'hostapp'
+        with:
+          name: balena-raw.img.zip
+          if-no-files-found: ignore
+          retention-days: 3
+          # Use 0 compression to avoid corrupting the encrypted files
+          compression-level: 0
+          # Look for both the encrypted (.enc) and unencrypted file variants.
+          path: |
+            ${{ env.S3_DEPLOY_PATH }}/image/balena-raw.img.zip
+            ${{ env.S3_DEPLOY_PATH }}/image/balena-raw.img.zip.enc
+
+      - name: Upload extension artifacts
+        if: matrix.image_class != 'hostapp'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ env.MACHINE }}-extension-${{ matrix.service_name }}  # abrp
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          path: |
+            build/tmp/deploy/images/${{ env.MACHINE }}/${{ matrix.recipe }}-${{ env.MACHINE }}.docker
+            ${{ matrix.assets }}
+
+  ##############################
+  # Leviathan Test
+  ##############################
+  all_jobs:
+    name: All jobs
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-24.04' || 'self-hosted' }}  # abrp: GH-hosted only when public
+    needs:
+      - approved-commit
+      - balena-lib
+      - build
+    # The default condition for jobs is success(), which means that this
+    # job would be skipped if a previous job failed.
+    # Unfortunately GitHub treats skipped jobs as a pass as far as merge requirements!
+    # So we override the conditions of this job to always run, and check
+    # the results of the previous jobs to return overall success or failure.
+    if: |
+      always()
+
+    defaults:
+      run:
+        working-directory: .
+        shell: bash --noprofile --norc -eo pipefail -x {0}
+
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - machine: ${{ inputs.machine }}
+            signing-environment: ${{ inputs.signing-environment }}
+
+    steps:
+      - name: Reject failed jobs
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ]
+          then
+            echo "One or more jobs have failed"
+            exit 1
+          fi
+
+      - name: Reject cancelled jobs
+        run: |
+          if [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]
+          then
+            echo "One or more jobs were cancelled"
+            exit 1
+          fi
