@@ -1,0 +1,161 @@
+name: Build & push supervisor image
+
+# Builds balena-supervisor from GitHub source (arm64) and pushes it to GHCR.
+# The balenaOS build (meta-abrp bbappend + the docker-disk entry.sh runtime
+# fallback) pulls it from there — no private registry involved; the image is
+# balena's own open-source supervisor.
+#
+# NOTE (2026-08-17): balena-supervisor's root Dockerfile is a deliberate
+# placeholder ("Do not use this Dockerfile", just FROM alpine — flowzone CI
+# stub). The real multi-stage build lives in Dockerfile.template with a single
+# %%BALENA_ARCH%% placeholder. The 2026-08-16 run built the placeholder and
+# pushed plain alpine as v19.0.8 (8.7MB, Cmd=/bin/sh) — devices pull-looped.
+# This workflow renders the template and verifies image content.
+#
+# Primary: native arm runner (ubuntu-24.04-arm — free for public repos,
+# billing-blocked while private). Fallback: self-hosted x64 runner with qemu
+# binfmt emulation, used whenever the primary fails to produce the image.
+
+on:
+  workflow_dispatch:
+    inputs:
+      supervisor-tag:
+        description: 'balena-supervisor release tag (must match layers/meta-abrp bbappend SUPERVISOR_VERSION)'
+        required: true
+        default: 'v19.0.8'
+
+permissions:
+  packages: write
+
+jobs:
+  build:
+    # ubuntu-24.04-arm is free ONLY for public repos; while private the job
+    # would fail at runner assignment (billing) and redden the whole run.
+    # Skipped here -> the fallback job runs (its condition accepts 'skipped').
+    if: github.event.repository.visibility == 'public'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout balena-supervisor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: balena-io/balena-supervisor
+          ref: ${{ inputs.supervisor-tag }}
+
+      - name: Render Dockerfile from Dockerfile.template (root Dockerfile is a CI stub!)
+        run: sed 's/%%BALENA_ARCH%%/aarch64/g' Dockerfile.template > Dockerfile
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push (linux/arm64)
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            VERSION=${{ inputs.supervisor-tag }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/aarch64-supervisor:${{ inputs.supervisor-tag }}
+
+      - name: Verify image content (Cmd must be entry.sh, size > 100MB)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          IMG=ghcr.io/${{ github.repository_owner }}/aarch64-supervisor:${{ inputs.supervisor-tag }}
+          echo "${GITHUB_TOKEN}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker pull "$IMG" >/dev/null
+          CMD_JSON=$(docker image inspect -f '{{json .Config.Cmd}}' "$IMG")
+          SIZE=$(docker image inspect -f '{{.Size}}' "$IMG")
+          DIGEST=$(docker image inspect -f '{{index .RepoDigests 0}}' "$IMG")
+          echo "Cmd=$CMD_JSON"
+          echo "Size=$SIZE bytes"
+          echo "Digest=$DIGEST"
+          echo "$CMD_JSON" | grep -q 'entry.sh' || { echo 'FAIL: Config.Cmd lacks entry.sh — placeholder/stub Dockerfile built?'; exit 1; }
+          [ "$SIZE" -gt 100000000 ] || { echo "FAIL: image suspiciously small ($SIZE < 100MB) — placeholder/stub Dockerfile built?"; exit 1; }
+          echo 'Content verification OK.'
+
+      - name: Logout from GHCR (self-hosted runner hygiene)
+        # abrp: docker login persists to ~/.docker/config.json on the runner;
+        # the run-scoped GITHUB_TOKEN expires and then poisons EVERY later
+        # anonymous ghcr.io pull on that host (denied: denied). Always logout.
+        if: always()
+        run: docker logout ghcr.io || true
+
+  # Fallback: same build on the self-hosted x64 runner under qemu emulation.
+  # Covers: repo private (primary SKIPPED — arm runners billing-blocked), arm
+  # runner outage, and real build failures. Runs for every primary result
+  # except success and cancelled.
+  build-fallback:
+    needs: build
+    if: >-
+      always() && !cancelled() &&
+      needs.build.result != 'success' &&
+      needs.build.result != 'cancelled'
+    runs-on: [self-hosted, X64, yocto]
+    steps:
+      - name: Checkout balena-supervisor
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: balena-io/balena-supervisor
+          ref: ${{ inputs.supervisor-tag }}
+
+      - name: Render Dockerfile from Dockerfile.template (root Dockerfile is a CI stub!)
+        run: sed 's/%%BALENA_ARCH%%/aarch64/g' Dockerfile.template > Dockerfile
+
+      # x64 host: register arm64 binfmt handlers so buildx can emulate
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push (linux/arm64, emulated)
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            VERSION=${{ inputs.supervisor-tag }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/aarch64-supervisor:${{ inputs.supervisor-tag }}
+
+      - name: Verify image content (Cmd must be entry.sh, size > 100MB)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          IMG=ghcr.io/${{ github.repository_owner }}/aarch64-supervisor:${{ inputs.supervisor-tag }}
+          echo "${GITHUB_TOKEN}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker pull "$IMG" >/dev/null
+          CMD_JSON=$(docker image inspect -f '{{json .Config.Cmd}}' "$IMG")
+          SIZE=$(docker image inspect -f '{{.Size}}' "$IMG")
+          DIGEST=$(docker image inspect -f '{{index .RepoDigests 0}}' "$IMG")
+          echo "Cmd=$CMD_JSON"
+          echo "Size=$SIZE bytes"
+          echo "Digest=$DIGEST"
+          echo "$CMD_JSON" | grep -q 'entry.sh' || { echo 'FAIL: Config.Cmd lacks entry.sh — placeholder/stub Dockerfile built?'; exit 1; }
+          [ "$SIZE" -gt 100000000 ] || { echo "FAIL: image suspiciously small ($SIZE < 100MB) — placeholder/stub Dockerfile built?"; exit 1; }
+          echo 'Content verification OK.'
+
+      - name: Logout from GHCR (self-hosted runner hygiene)
+        # abrp: docker login persists to ~/.docker/config.json on the runner;
+        # the run-scoped GITHUB_TOKEN expires and then poisons EVERY later
+        # anonymous ghcr.io pull on that host (denied: denied). Always logout.
+        if: always()
+        run: docker logout ghcr.io || true
