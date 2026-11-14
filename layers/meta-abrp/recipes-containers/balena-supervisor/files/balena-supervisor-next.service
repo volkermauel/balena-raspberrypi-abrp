@@ -1,0 +1,22 @@
+[Unit]
+Description=Balena supervisor composition (core-next and service-relay)
+Documentation=https://github.com/balena-io/helios
+# The takeover and API key extraction require the running supervisor
+Requires=balena-supervisor.service
+After=balena-supervisor.service
+ConditionPathExists=/etc/balena-supervisor/supervisor-compose.yml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The unit only reconciles the composition at boot; container crashes are
+# handled by the restart policies inside the compose file
+Restart=on-failure
+RestartSec=10s
+Environment=DOCKER_HOST=unix:///var/run/balena-engine.sock
+ExecStartPre=/usr/bin/supervisor-compose-env.sh
+ExecStart=/usr/bin/docker-compose --project-name supervisor --env-file /run/supervisor-compose.env --project-directory /etc/balena-supervisor -f /etc/balena-supervisor/supervisor-compose.yml up --detach --remove-orphans
+ExecStop=/usr/bin/docker-compose --project-name supervisor --project-directory /etc/balena-supervisor -f /etc/balena-supervisor/supervisor-compose.yml down
+
+[Install]
+WantedBy=multi-user.target
