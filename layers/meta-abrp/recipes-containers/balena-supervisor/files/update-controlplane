@@ -1,0 +1,152 @@
+#!/bin/sh
+
+# abrp: control plane updater (supervisor "core" + helios "core-next").
+#
+# A control plane version is a pair tag (e.g. v19.0.8-h0.25.28) that exists
+# in lockstep on two GHCR repos:
+#   ghcr.io/volkermauel/controlplane-supervisor:<pair>
+#   ghcr.io/volkermauel/controlplane-helios:<pair>
+# CI (build-controlplane.yml) produces both from the tested base images and
+# stamps them with io.abrp.controlplane.version=<pair>. The device trusts
+# the labels, not the tags it pulled: a channel tag can straddle a
+# half-finished registry push, labels cannot lie about their own build.
+#
+# Usage:
+#   update-controlplane <pair-tag>   Apply an explicit version (canary/rollback)
+#   update-controlplane --check      Follow the :stable channel (timer mode)
+#   update-controlplane --status     Show current control plane versions
+#
+# Sequence: pull both images and verify the pair BEFORE touching anything,
+# then update core via update-balena-supervisor (rewrites supervisor.conf,
+# restarts balena-supervisor.service, state-persistent), then core-next via
+# /mnt/state/supervisor-compose.override + balena-supervisor-next restart.
+#
+# Rollback: run again with an older pair tag. Pair tags are the only
+# rollback anchor - never delete them from the registry.
+
+set -o pipefail
+
+# shellcheck disable=SC1091
+. /usr/libexec/os-helpers-logging
+
+REGISTRY_PREFIX="ghcr.io/volkermauel"
+CHANNEL="stable"
+VERSION_FILE="/mnt/state/controlplane-version"
+OVERRIDE_FILE="/mnt/state/supervisor-compose.override"
+LABEL="io.abrp.controlplane.version"
+
+# Detect container engine (mirrors update-balena-supervisor)
+if which balena >/dev/null 2>&1; then
+    DOCKER=balena
+elif which docker >/dev/null 2>&1; then
+    DOCKER=docker
+else
+    error "no container engine detected"
+    exit 1
+fi
+
+label_of() {
+    $DOCKER inspect --format "{{index .Config.Labels \"$LABEL\"}}" "$1" 2>/dev/null
+}
+
+fetch_pair() {
+    # $1: component repo (controlplane-supervisor|controlplane-helios)
+    # $2: tag (pair tag, or a channel tag in --check mode)
+    # Pulls the image, retags it to its immutable pair tag and prints the
+    # pair. All later references use the pair tag, never the channel tag.
+    ref="$REGISTRY_PREFIX/$1:$2"
+    info "Pulling $ref ..."
+    if ! out=$($DOCKER pull "$ref" 2>&1); then
+        error "$out"
+        return 1
+    fi
+    pair=$(label_of "$ref")
+    if [ -z "$pair" ] || [ "$pair" = "<no value>" ]; then
+        error "$ref carries no $LABEL label (not built by build-controlplane?)"
+        return 1
+    fi
+    $DOCKER tag "$ref" "$REGISTRY_PREFIX/$1:$pair" || return 1
+    echo "$pair"
+}
+
+apply_pair() {
+    # $1: verified pair tag; both images are already pulled and retagged
+    pair="$1"
+    sup_ref="$REGISTRY_PREFIX/controlplane-supervisor:$pair"
+    hel_ref="$REGISTRY_PREFIX/controlplane-helios:$pair"
+
+    # 1. core. update-balena-supervisor pulls (no-op, already local),
+    #    rewrites /etc/balena-supervisor/supervisor.conf and restarts
+    #    balena-supervisor.service. Restarting that unit stops
+    #    balena-supervisor-next (Requires=), so bring it back up on any path.
+    UPDATER=$(command -v update-balena-supervisor || echo /usr/bin/update-balena-supervisor)
+    if ! "$UPDATER" -i "$sup_ref"; then
+        error "supervisor update failed; restarting composition with current images"
+        systemctl start balena-supervisor-next || true
+        return 1
+    fi
+
+    # 2. core-next. Point the composition override at the new helios image;
+    #    supervisor-compose-env.sh validates and passes it to compose, which
+    #    uses the already-local image (no further pull).
+    echo "HELIOS_IMAGE=$hel_ref" > "$OVERRIDE_FILE"
+    if ! systemctl restart balena-supervisor-next; then
+        error "balena-supervisor-next restart failed"
+        return 1
+    fi
+
+    echo "$pair" > "$VERSION_FILE"
+    sync -f /mnt/state 2>/dev/null || true
+    info "Control plane updated to $pair"
+}
+
+show_status() {
+    echo "Control plane version: $(cat "$VERSION_FILE" 2>/dev/null || echo 'unknown (OS build defaults in use)')"
+    echo "core      (supervisor.conf): $(sed -n 's/^SUPERVISOR_IMAGE=//p' /etc/balena-supervisor/supervisor.conf 2>/dev/null)"
+    echo "core-next (override):        $(sed -n 's/^HELIOS_IMAGE=//p' "$OVERRIDE_FILE" 2>/dev/null || echo '(none - build-time default)')"
+    $DOCKER ps --filter name=balena_supervisor --format 'running core:      {{.Image}} ({{.Status}})'
+    $DOCKER ps --filter name=supervisor-core-next-1 --format 'running core-next: {{.Image}} ({{.Status}})'
+}
+
+usage() {
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+    --status)
+        show_status
+        ;;
+    --check)
+        sup_pair=$(fetch_pair controlplane-supervisor "$CHANNEL") || exit 1
+        hel_pair=$(fetch_pair controlplane-helios "$CHANNEL") || exit 1
+        if [ "$sup_pair" != "$hel_pair" ]; then
+            # Both channel tags must resolve to the same pair: this skips a
+            # half-finished promote and retries on the next timer tick.
+            warn "channel '$CHANNEL' inconsistent (supervisor=$sup_pair helios=$hel_pair), skipping"
+            exit 0
+        fi
+        current=$(cat "$VERSION_FILE" 2>/dev/null)
+        if [ "$sup_pair" = "$current" ]; then
+            info "Already at $sup_pair"
+            exit 0
+        fi
+        apply_pair "$sup_pair"
+        ;;
+    -h|--help)
+        usage
+        ;;
+    "")
+        show_status
+        ;;
+    *)
+        tag="$1"
+        case "$tag" in
+            *[!A-Za-z0-9._-]*|'') fail "invalid pair tag '$tag'" ;;
+        esac
+        sup_pair=$(fetch_pair controlplane-supervisor "$tag") || exit 1
+        hel_pair=$(fetch_pair controlplane-helios "$tag") || exit 1
+        [ "$sup_pair" = "$hel_pair" ] || fail "pair mismatch: supervisor=$sup_pair helios=$hel_pair"
+        [ "$sup_pair" = "$tag" ] || warn "requested '$tag' but images are labelled '$sup_pair'; applying labels"
+        apply_pair "$sup_pair"
+        ;;
+esac

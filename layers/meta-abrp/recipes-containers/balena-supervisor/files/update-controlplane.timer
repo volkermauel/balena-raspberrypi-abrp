@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily control plane channel check
+
+[Timer]
+OnBootSec=20min
+OnUnitInactiveSec=1d
+RandomizedDelaySec=3600
+
+[Install]
+WantedBy=multi-user.target
